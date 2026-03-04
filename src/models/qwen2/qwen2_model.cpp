@@ -117,10 +117,10 @@ void Qwen2Model::bind_weights(const LlaisysQwen2Weights &weights) {
 
 Qwen2Session *Qwen2Model::create_session() {
     Qwen2Config config{
-        .nlayers = _meta.nlayer,
-        .maxseq = _meta.maxseq,
-        .nkvhead = _meta.nkvh,
-        .head_size = _meta.dh,
+        _meta.nlayer,
+        _meta.maxseq,
+        _meta.nkvh,
+        _meta.dh
     };
     return new Qwen2Session(config, _device);
 }
