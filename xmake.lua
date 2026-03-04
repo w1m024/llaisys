@@ -23,9 +23,13 @@ target("llaisys-utils")
 
     set_languages("cxx17")
     set_warnings("all", "error")
-    if not is_plat("windows") then
-        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
-        add_ldflags("-fopenmp")
+    
+    add_rules("c++.openmp")
+
+    if is_plat("windows") then
+        add_cxflags("/O2", "/arch:AVX2")
+    else
+        add_cxflags("-fPIC", "-Wno-unknown-pragmas", "-O3", "-march=native")
     end
 
     add_files("src/utils/*.cpp")
@@ -41,6 +45,7 @@ target("llaisys-device")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
@@ -57,6 +62,7 @@ target("llaisys-core")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
@@ -72,6 +78,7 @@ target("llaisys-tensor")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
@@ -87,6 +94,7 @@ target("llaisys-ops")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
@@ -106,6 +114,18 @@ target("llaisys")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    
+    add_rules("c++.openmp")
+
+    if is_plat("windows") then
+        add_cxflags("/O2", "/arch:AVX2")
+    else
+        add_cxflags("-O3", "-march=native")
+        -- Explicitly link OpenMP on Linux
+        add_ldflags("-fopenmp")
+        add_syslinks("gomp")
+    end
+
     add_files("src/llaisys/*.cc")
     add_files("src/models/qwen2/*.cpp")
     set_installdir(".")
