@@ -19,7 +19,7 @@ void linear_t(std::byte* out_raw,
     T* y = reinterpret_cast<T*>(out_raw);
 
     #pragma omp parallel for
-    for(size_t i = 0; i < batch; ++i) {
+    for(long long i = 0; i < static_cast<long long>(batch); ++i) {
         const T* x_row = x + i * in_features;
         T* y_row = y + i * out_features;
         for(size_t j = 0; j < out_features; ++j) {
