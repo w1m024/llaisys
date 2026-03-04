@@ -24,7 +24,8 @@ target("llaisys-utils")
     set_languages("cxx17")
     set_warnings("all", "error")
     
-    add_rules("c++.openmp")
+    -- Enable OpenMP support (cross-platform)
+    add_packages("openmp")
 
     if is_plat("windows") then
         add_cxflags("/O2", "/arch:AVX2")
@@ -115,7 +116,8 @@ target("llaisys")
     set_languages("cxx17")
     set_warnings("all", "error")
     
-    add_rules("c++.openmp")
+    -- Enable OpenMP support (cross-platform)
+    add_packages("openmp")
 
     if is_plat("windows") then
         add_cxflags("/O2", "/arch:AVX2")

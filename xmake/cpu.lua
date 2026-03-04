@@ -3,7 +3,7 @@ target("llaisys-device-cpu")
     set_languages("cxx17")
     set_warnings("all", "error")
     
-    add_rules("c++.openmp")
+    add_packages("openmp")
     
     if is_plat("windows") then
         add_cxflags("/O2", "/arch:AVX2")
@@ -22,7 +22,7 @@ target("llaisys-ops-cpu")
     set_languages("cxx17")
     set_warnings("all", "error")
     
-    add_rules("c++.openmp")
+    add_packages("openmp")
 
     if is_plat("windows") then
         add_cxflags("/O2", "/arch:AVX2")
