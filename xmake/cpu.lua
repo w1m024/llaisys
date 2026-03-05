@@ -2,8 +2,13 @@ target("llaisys-device-cpu")
     set_kind("static")
     set_languages("cxx17")
     set_warnings("all", "error")
-    if not is_plat("windows") then
-        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    
+    add_packages("openmp")
+    
+    if is_plat("windows") then
+        add_cxflags("/O2", "/arch:AVX2")
+    else
+        add_cxflags("-fPIC", "-Wno-unknown-pragmas", "-O3", "-march=native")
     end
 
     add_files("../src/device/cpu/*.cpp")
@@ -16,12 +21,16 @@ target("llaisys-ops-cpu")
     add_deps("llaisys-tensor")
     set_languages("cxx17")
     set_warnings("all", "error")
-    if not is_plat("windows") then
-        add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    
+    add_packages("openmp")
+
+    if is_plat("windows") then
+        add_cxflags("/O2", "/arch:AVX2")
+    else
+        add_cxflags("-fPIC", "-Wno-unknown-pragmas", "-O3", "-march=native")
     end
 
     add_files("../src/ops/*/cpu/*.cpp")
 
     on_install(function (target) end)
 target_end()
-
