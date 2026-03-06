@@ -3,6 +3,7 @@
 #include "llaisys_tensor.hpp"
 #include "../models/qwen2/qwen2_model.hpp"
 #include "../models/qwen2/qwen2_session.hpp"
+#include <vector>
 #include "../utils.hpp"
 
 struct LlaisysQwen2Model {
@@ -216,5 +217,83 @@ LLAISYS_EXTERN_C {
             log_c_api_error(__func__, __FILE__, __LINE__, "Unknown exception");
         }
         return model->meta.end_token;
+    }
+
+    void llaisysQwen2ModelInferBatch(
+        struct LlaisysQwen2Model *model,
+        struct LlaisysQwen2Session **sessions,
+        int64_t **batch_token_ids,
+        size_t *ntokens,
+        int batch_size,
+        int *top_ks,
+        float *top_ps,
+        float *temperatures,
+        int64_t *seeds,
+        int64_t *results) {
+        
+        if (!model) {
+            log_c_api_error(__func__, __FILE__, __LINE__, "Invalid argument: model is null");
+            return;
+        }
+        if (!sessions || !batch_token_ids || !ntokens || !results) {
+            log_c_api_error(__func__, __FILE__, __LINE__, "Invalid argument: array pointers are null");
+            return;
+        }
+
+        try {
+            model->impl->bind_weights(model->weights);
+            
+            std::vector<llaisys::models::qwen2::Qwen2Session*> session_vec;
+            session_vec.reserve(batch_size);
+            
+            std::vector<std::vector<int64_t>> tokens_vec;
+            tokens_vec.reserve(batch_size);
+            
+            std::vector<int> top_ks_vec;
+            std::vector<float> top_ps_vec;
+            std::vector<float> temps_vec;
+            std::vector<int64_t> seeds_vec;
+            
+            top_ks_vec.reserve(batch_size);
+            top_ps_vec.reserve(batch_size);
+            temps_vec.reserve(batch_size);
+            seeds_vec.reserve(batch_size);
+
+            for (int i = 0; i < batch_size; ++i) {
+                if (!sessions[i] || !sessions[i]->impl) {
+                    log_c_api_error(__func__, __FILE__, __LINE__, "Invalid argument: session in batch is null");
+                    return;
+                }
+                session_vec.push_back(sessions[i]->impl);
+                
+                std::vector<int64_t> t;
+                if (ntokens[i] > 0 && batch_token_ids[i]) {
+                    t.assign(batch_token_ids[i], batch_token_ids[i] + ntokens[i]);
+                }
+                tokens_vec.push_back(t);
+                
+                top_ks_vec.push_back(top_ks ? top_ks[i] : 1);
+                top_ps_vec.push_back(top_ps ? top_ps[i] : 0.0f);
+                temps_vec.push_back(temperatures ? temperatures[i] : 1.0f);
+                seeds_vec.push_back(seeds ? seeds[i] : -1);
+            }
+
+            auto res = model->impl->infer_batch(
+                session_vec,
+                tokens_vec,
+                top_ks_vec,
+                top_ps_vec,
+                temps_vec,
+                seeds_vec
+            );
+
+            for (int i = 0; i < batch_size; ++i) {
+                results[i] = res[i];
+            }
+        } catch (const std::exception &e) {
+            log_c_api_error(__func__, __FILE__, __LINE__, e.what());
+        } catch (...) {
+            log_c_api_error(__func__, __FILE__, __LINE__, "Unknown exception");
+        }
     }
 }

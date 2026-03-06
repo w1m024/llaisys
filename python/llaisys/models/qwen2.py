@@ -238,27 +238,117 @@ class Qwen2:
 
     def generate(
         self,
-        inputs: Sequence[int],
+        input_ids: Sequence[int],
         max_new_tokens: int = None,
         top_k: int = 1,
         top_p: float = 0.0,
         temperature: float = 1.0,
         seed: int = -1,
         stream: bool = False,
-        session = None,
-    ):
+        session: Optional[Any] = None
+    ) -> Union[List[int], Iterator[int]]:
+        """
+        Generate text from input_ids.
+        
+        Args:
+            input_ids: List of token IDs
+            max_new_tokens: Maximum number of tokens to generate
+            top_k: Top-K sampling
+            top_p: Top-P sampling
+            temperature: Sampling temperature
+            seed: Random seed
+            stream: Whether to return an iterator
+            session: Optional Qwen2Session object
+            
+        Returns:
+            List of token IDs (full sequence) or Iterator[int] (new tokens only)
+        """
         if session is None:
-            session = self._default_session
+            # For backward compatibility / ease of use
+            # But note: this session is temporary and won't persist history across calls
+            # unless user manages it.
+            session = self.create_session()
+            # If not streaming, we might want to auto-destroy? 
+            # But Python GC will handle it if we don't return it.
+            # Let's keep it simple.
+
+        session_handle = session._handle if hasattr(session, "_handle") else session
 
         if stream:
             return self._generate_stream(
-                inputs, max_new_tokens, top_k, top_p, temperature, seed, session
+                session_handle, input_ids, max_new_tokens, top_k, top_p, temperature, seed
+            )
+        else:
+            return self._generate_sync(
+                session_handle, input_ids, max_new_tokens, top_k, top_p, temperature, seed
             )
 
+    def generate_batch(
+        self,
+        sessions: List[Any],
+        batch_input_ids: List[List[int]],
+        top_ks: List[int],
+        top_ps: List[float],
+        temperatures: List[float],
+        seeds: List[int]
+    ) -> List[int]:
+        """
+        Run one step of inference for a batch of sessions.
+        Returns the next token for each session.
+        """
+        batch_size = len(sessions)
+        if batch_size == 0:
+            return []
+            
+        # Prepare C arrays
+        session_ptrs = (ctypes.POINTER(ctypes.c_void_p) * batch_size)()
+        token_ptrs = (ctypes.POINTER(ctypes.c_int64) * batch_size)()
+        ntokens_arr = (ctypes.c_size_t * batch_size)()
+        
+        # Keep references to arrays to prevent GC
+        input_arrays = [] 
+        
+        for i in range(batch_size):
+            # Handle session object or raw pointer
+            s = sessions[i]
+            if hasattr(s, "_handle"):
+                s = s._handle
+            session_ptrs[i] = ctypes.cast(s, ctypes.POINTER(ctypes.c_void_p))
+            
+            tokens = batch_input_ids[i]
+            n = len(tokens)
+            arr = (ctypes.c_int64 * n)(*tokens)
+            input_arrays.append(arr)
+            
+            token_ptrs[i] = arr
+            ntokens_arr[i] = n
+            
+        top_ks_arr = (ctypes.c_int * batch_size)(*top_ks)
+        top_ps_arr = (ctypes.c_float * batch_size)(*top_ps)
+        temps_arr = (ctypes.c_float * batch_size)(*temperatures)
+        seeds_arr = (ctypes.c_int64 * batch_size)(*seeds)
+        results_arr = (ctypes.c_int64 * batch_size)()
+        
+        LIB_LLAISYS.llaisysQwen2ModelInferBatch(
+            self._model,
+            ctypes.cast(session_ptrs, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))),
+            token_ptrs,
+            ntokens_arr,
+            ctypes.c_int(batch_size),
+            top_ks_arr,
+            top_ps_arr,
+            temps_arr,
+            seeds_arr,
+            results_arr
+        )
+        
+        return list(results_arr)
+
+    def _generate_sync(self, session, input_ids, max_new_tokens, top_k, top_p, temperature, seed):
         if max_new_tokens is None:
             max_new_tokens = 128
 
-        tokens = list(inputs)
+        tokens = list(input_ids)
         for _ in range(max_new_tokens):
             arr = (ctypes.c_int64 * len(tokens))(*tokens)
             next_token = int(
@@ -281,13 +371,13 @@ class Qwen2:
 
     def _generate_stream(
         self,
+        session,
         inputs: Sequence[int],
         max_new_tokens: int = None,
         top_k: int = 1,
         top_p: float = 0.0,
         temperature: float = 1.0,
         seed: int = -1,
-        session = None,
     ):
         if max_new_tokens is None:
             max_new_tokens = 128

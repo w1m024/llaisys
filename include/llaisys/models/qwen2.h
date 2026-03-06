@@ -44,5 +44,18 @@ LLAISYS_EXTERN_C {
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, struct LlaisysQwen2Session * session, int64_t * token_ids, size_t ntoken);
 
     __export int64_t llaisysQwen2ModelInferEx(struct LlaisysQwen2Model * model, struct LlaisysQwen2Session * session, int64_t * token_ids, size_t ntoken, int top_k, float top_p, float temperature, int64_t seed);
+
+    __export void llaisysQwen2ModelInferBatch(
+        struct LlaisysQwen2Model * model,
+        struct LlaisysQwen2Session ** sessions,
+        int64_t ** batch_token_ids,
+        size_t * ntokens,
+        int batch_size,
+        int * top_ks,
+        float * top_ps,
+        float * temperatures,
+        int64_t * seeds,
+        int64_t * results
+    );
 }
 #endif // LLAISYS_MODELS_QWEN2_H

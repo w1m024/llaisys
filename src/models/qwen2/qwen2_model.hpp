@@ -52,9 +52,21 @@ public:
 
     void bind_weights(const LlaisysQwen2Weights &weights);
     int64_t infer(Qwen2Session *session, const int64_t *token_ids, size_t ntoken, int top_k, float top_p, float temperature, int64_t seed = -1);
+    
+    // Batch Inference API
+    std::vector<int64_t> infer_batch(
+        const std::vector<Qwen2Session*> &sessions,
+        const std::vector<std::vector<int64_t>> &batch_token_ids,
+        const std::vector<int> &top_ks,
+        const std::vector<float> &top_ps,
+        const std::vector<float> &temperatures,
+        const std::vector<int64_t> &seeds
+    );
 
 private:
     void process_token(Qwen2Session *session, int64_t token_id);
+    // Batch processing helper
+    void process_batch(const std::vector<Qwen2Session*> &sessions, const std::vector<int64_t> &token_ids);
 
     LlaisysQwen2Meta _meta;
     llaisysDeviceType_t _device;
