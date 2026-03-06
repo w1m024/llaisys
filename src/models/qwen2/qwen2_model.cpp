@@ -49,32 +49,6 @@ Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta, llaisysDeviceType_t device,
     CHECK_ARGUMENT(_meta.nh * _meta.dh == _meta.hs, "nh * dh must equal hidden_size");
 
     _attn_scale = 1.0f / std::sqrt(static_cast<float>(_meta.dh));
-
-    _token_ids = Tensor::create({1}, LLAISYS_DTYPE_I64, _device, _device_id);
-    _pos_ids = Tensor::create({1}, LLAISYS_DTYPE_I64, _device, _device_id);
-    _hidden = Tensor::create({1, _meta.hs}, _meta.dtype, _device, _device_id);
-    _attn_norm = Tensor::create({1, _meta.hs}, _meta.dtype, _device, _device_id);
-    _q_proj = Tensor::create({1, _meta.nh * _meta.dh}, _meta.dtype, _device, _device_id);
-    _k_proj = Tensor::create({1, _meta.nkvh * _meta.dh}, _meta.dtype, _device, _device_id);
-    _v_proj = Tensor::create({1, _meta.nkvh * _meta.dh}, _meta.dtype, _device, _device_id);
-    _q_view = _q_proj->view({1, _meta.nh, _meta.dh});
-    _k_view = _k_proj->view({1, _meta.nkvh, _meta.dh});
-    _v_view = _v_proj->view({1, _meta.nkvh, _meta.dh});
-    _q_rope = Tensor::create({1, _meta.nh, _meta.dh}, _meta.dtype, _device, _device_id);
-    _k_rope = Tensor::create({1, _meta.nkvh, _meta.dh}, _meta.dtype, _device, _device_id);
-    _attn_out = Tensor::create({1, _meta.nh, _meta.dh}, _meta.dtype, _device, _device_id);
-    _attn_out_flat = _attn_out->view({1, _meta.hs});
-    _attn_proj = Tensor::create({1, _meta.hs}, _meta.dtype, _device, _device_id);
-    _mlp_norm = Tensor::create({1, _meta.hs}, _meta.dtype, _device, _device_id);
-    _mlp_gate = Tensor::create({1, _meta.di}, _meta.dtype, _device, _device_id);
-    _mlp_up = Tensor::create({1, _meta.di}, _meta.dtype, _device, _device_id);
-    _mlp_act = Tensor::create({1, _meta.di}, _meta.dtype, _device, _device_id);
-    _mlp_down = Tensor::create({1, _meta.hs}, _meta.dtype, _device, _device_id);
-    _final_norm = Tensor::create({1, _meta.hs}, _meta.dtype, _device, _device_id);
-    _logits = Tensor::create({1, _meta.voc}, _meta.dtype, _device, _device_id);
-    _logits_flat = _logits->view({_meta.voc});
-    _max_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, _device, _device_id);
-    _max_val = Tensor::create({1}, _meta.dtype, _device, _device_id);
 }
 
 void Qwen2Model::bind_weights(const LlaisysQwen2Weights &weights) {
@@ -120,9 +94,14 @@ Qwen2Session *Qwen2Model::create_session() {
         _meta.nlayer,
         _meta.maxseq,
         _meta.nkvh,
-        _meta.dh
+        _meta.dh,
+        _meta.hs,
+        _meta.nh,
+        _meta.di,
+        _meta.voc,
+        _meta.dtype
     };
-    return new Qwen2Session(config, _device);
+    return new Qwen2Session(config, _device, _device_id);
 }
 
 int64_t Qwen2Model::infer(Qwen2Session *session, const int64_t *token_ids, size_t ntoken, int top_k, float top_p, float temperature, int64_t seed) {
@@ -148,16 +127,16 @@ int64_t Qwen2Model::infer(Qwen2Session *session, const int64_t *token_ids, size_
         process_token(session, token_ids[i]);
     }
 
-    llaisys::ops::rms_norm(_final_norm, _hidden, _weights.out_norm_w, _meta.epsilon);
-    llaisys::ops::linear(_logits, _final_norm, _weights.out_embed, nullptr);
+    llaisys::ops::rms_norm(session->_final_norm, session->_hidden, _weights.out_norm_w, _meta.epsilon);
+    llaisys::ops::linear(session->_logits, session->_final_norm, _weights.out_embed, nullptr);
 
     if (top_k > 1 || top_p > 0.0f) {
-        llaisys::ops::sample(_max_idx, _logits_flat, top_k, top_p, temperature, seed);
+        llaisys::ops::sample(session->_max_idx, session->_logits_flat, top_k, top_p, temperature, seed);
     } else {
-        llaisys::ops::argmax(_max_idx, _max_val, _logits_flat);
+        llaisys::ops::argmax(session->_max_idx, session->_max_val, session->_logits_flat);
     }
 
-    auto *idx_ptr = reinterpret_cast<const int64_t *>(_max_idx->data());
+    auto *idx_ptr = reinterpret_cast<const int64_t *>(session->_max_idx->data());
     return idx_ptr[0];
 }
 
@@ -165,39 +144,39 @@ void Qwen2Model::process_token(Qwen2Session *session, int64_t token_id) {
     auto &kv_cache = session->kv_cache();
     int64_t pos = static_cast<int64_t>(kv_cache.seq_len());
 
-    _token_ids->load(&token_id);
-    _pos_ids->load(&pos);
+    session->_token_ids->load(&token_id);
+    session->_pos_ids->load(&pos);
 
-    llaisys::ops::embedding(_hidden, _token_ids, _weights.in_embed);
+    llaisys::ops::embedding(session->_hidden, session->_token_ids, _weights.in_embed);
 
     for (size_t layer = 0; layer < _meta.nlayer; ++layer) {
-        llaisys::ops::rms_norm(_attn_norm, _hidden, _weights.attn_norm_w[layer], _meta.epsilon);
+        llaisys::ops::rms_norm(session->_attn_norm, session->_hidden, _weights.attn_norm_w[layer], _meta.epsilon);
 
-        llaisys::ops::linear(_q_proj, _attn_norm, _weights.attn_q_w[layer], _weights.attn_q_b[layer]);
-        llaisys::ops::linear(_k_proj, _attn_norm, _weights.attn_k_w[layer], _weights.attn_k_b[layer]);
-        llaisys::ops::linear(_v_proj, _attn_norm, _weights.attn_v_w[layer], _weights.attn_v_b[layer]);
+        llaisys::ops::linear(session->_q_proj, session->_attn_norm, _weights.attn_q_w[layer], _weights.attn_q_b[layer]);
+        llaisys::ops::linear(session->_k_proj, session->_attn_norm, _weights.attn_k_w[layer], _weights.attn_k_b[layer]);
+        llaisys::ops::linear(session->_v_proj, session->_attn_norm, _weights.attn_v_w[layer], _weights.attn_v_b[layer]);
 
-        llaisys::ops::rope(_q_rope, _q_view, _pos_ids, _meta.theta);
-        llaisys::ops::rope(_k_rope, _k_view, _pos_ids, _meta.theta);
+        llaisys::ops::rope(session->_q_rope, session->_q_view, session->_pos_ids, _meta.theta);
+        llaisys::ops::rope(session->_k_rope, session->_k_view, session->_pos_ids, _meta.theta);
 
         auto k_cache_slice = kv_cache.k(layer)->slice(0, pos, pos + 1);
         auto v_cache_slice = kv_cache.v(layer)->slice(0, pos, pos + 1);
-        llaisys::ops::rearrange(k_cache_slice, _k_rope);
-        llaisys::ops::rearrange(v_cache_slice, _v_view);
+        llaisys::ops::rearrange(k_cache_slice, session->_k_rope);
+        llaisys::ops::rearrange(v_cache_slice, session->_v_view);
 
         auto k_cache = kv_cache.k(layer)->slice(0, 0, pos + 1);
         auto v_cache = kv_cache.v(layer)->slice(0, 0, pos + 1);
 
-        llaisys::ops::self_attention(_attn_out, _q_rope, k_cache, v_cache, _attn_scale);
-        llaisys::ops::linear(_attn_proj, _attn_out_flat, _weights.attn_o_w[layer], nullptr);
-        llaisys::ops::add(_hidden, _hidden, _attn_proj);
+        llaisys::ops::self_attention(session->_attn_out, session->_q_rope, k_cache, v_cache, _attn_scale);
+        llaisys::ops::linear(session->_attn_proj, session->_attn_out_flat, _weights.attn_o_w[layer], nullptr);
+        llaisys::ops::add(session->_hidden, session->_hidden, session->_attn_proj);
 
-        llaisys::ops::rms_norm(_mlp_norm, _hidden, _weights.mlp_norm_w[layer], _meta.epsilon);
-        llaisys::ops::linear(_mlp_gate, _mlp_norm, _weights.mlp_gate_w[layer], nullptr);
-        llaisys::ops::linear(_mlp_up, _mlp_norm, _weights.mlp_up_w[layer], nullptr);
-        llaisys::ops::swiglu(_mlp_act, _mlp_gate, _mlp_up);
-        llaisys::ops::linear(_mlp_down, _mlp_act, _weights.mlp_down_w[layer], nullptr);
-        llaisys::ops::add(_hidden, _hidden, _mlp_down);
+        llaisys::ops::rms_norm(session->_mlp_norm, session->_hidden, _weights.mlp_norm_w[layer], _meta.epsilon);
+        llaisys::ops::linear(session->_mlp_gate, session->_mlp_norm, _weights.mlp_gate_w[layer], nullptr);
+        llaisys::ops::linear(session->_mlp_up, session->_mlp_norm, _weights.mlp_up_w[layer], nullptr);
+        llaisys::ops::swiglu(session->_mlp_act, session->_mlp_gate, session->_mlp_up);
+        llaisys::ops::linear(session->_mlp_down, session->_mlp_act, _weights.mlp_down_w[layer], nullptr);
+        llaisys::ops::add(session->_hidden, session->_hidden, session->_mlp_down);
     }
 
     kv_cache.advance(1);
