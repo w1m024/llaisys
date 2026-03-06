@@ -74,7 +74,7 @@ void free_layer_arrays(LlaisysQwen2Weights &weights) {
 }
 } // namespace
 
-__C {
+LLAISYS_EXTERN_C {
     struct LlaisysQwen2Model *llaisysQwen2ModelCreate(
         const LlaisysQwen2Meta *meta,
         llaisysDeviceType_t device,

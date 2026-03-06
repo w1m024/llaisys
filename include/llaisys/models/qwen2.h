@@ -3,7 +3,7 @@
 
 #include "../tensor.h"
 
-__C {
+LLAISYS_EXTERN_C {
     struct LlaisysQwen2Meta {
         llaisysDataType_t dtype;
         size_t nlayer, hs, nh, nkvh, dh, di, maxseq, voc;
