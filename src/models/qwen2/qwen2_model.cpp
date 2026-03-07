@@ -386,8 +386,10 @@ void Qwen2Model::process_batch(const std::vector<Qwen2Session*> &sessions, const
 
         // For now, let's just loop.
         for (size_t b = 0; b < batch; ++b) {
-            auto &kv_cache = sessions[b]->kv_cache();
-            int64_t pos = static_cast<int64_t>(kv_cache.seq_len());
+            // Ensure session has space for next token
+            sessions[b]->ensure_capacity_for_next_token();
+            
+            int64_t pos = static_cast<int64_t>(sessions[b]->seq_len());
             
             // Extract slices from batch tensors
             // q_rope: [batch, 1, nh, dh] -> slice(b, b+1)
@@ -395,31 +397,44 @@ void Qwen2Model::process_batch(const std::vector<Qwen2Session*> &sessions, const
             auto k_rope_slice = batch_k_rope->slice(0, b, b+1)->view({1, _meta.nkvh, _meta.dh});
             auto v_view_slice = batch_v_view->slice(0, b, b+1)->view({1, _meta.nkvh, _meta.dh});
             
-            // Update Cache
-            auto k_cache_slot = kv_cache.k(layer)->slice(0, pos, pos + 1);
-            auto v_cache_slot = kv_cache.v(layer)->slice(0, pos, pos + 1);
+            // Update Cache: Write to current block
+            sessions[b]->write_kv(layer, k_rope_slice, v_view_slice);
             
-            llaisys::ops::rearrange(k_cache_slot, q_rope_slice); // Wait, we need K here, not Q. Logic error in previous code?
-            // In process_token: 
-            // ops::rearrange(k_cache_slice, session->_k_rope);
-            // ops::rearrange(v_cache_slice, session->_v_view);
-            // Ah, k_rope_slice is what we need.
+            // Prepare inputs for Attention
+            // Since our self_attention op requires contiguous memory, we must gather blocks into a temp buffer.
+            // This is slow but necessary without PagedAttention op.
             
-            // Note: rearrange is just a copy if shapes match.
-            // k_rope_slice is [1, nkvh, dh]
-            // k_cache_slot is [1, nkvh, dh]
-            // We can just copy.
-             llaisys::ops::rearrange(k_cache_slot, k_rope_slice);
-             llaisys::ops::rearrange(v_cache_slot, v_view_slice);
+            // Allocate temp contiguous cache
+            // Shape: [1, pos + 1, nkvh, dh]
+            auto temp_k_cache = Tensor::create({1, static_cast<size_t>(pos + 1), _meta.nkvh, _meta.dh}, _meta.dtype, _device, _device_id);
+            auto temp_v_cache = Tensor::create({1, static_cast<size_t>(pos + 1), _meta.nkvh, _meta.dh}, _meta.dtype, _device, _device_id);
+            
+            // Gather from blocks
+            size_t current_offset = 0;
+            const auto& blocks = sessions[b]->blocks();
+            for (const auto& block : blocks) {
+                if (block->used == 0) continue;
+                 auto k_src = block->k_blocks[layer]->slice(0, 0, block->used);
+                 auto v_src = block->v_blocks[layer]->slice(0, 0, block->used);
+                 
+                 auto k_dst = temp_k_cache->slice(1, current_offset, current_offset + block->used);
+                 auto v_dst = temp_v_cache->slice(1, current_offset, current_offset + block->used);
+                 
+                 llaisys::ops::rearrange(k_dst, k_src);
+                 llaisys::ops::rearrange(v_dst, v_src);
+                 current_offset += block->used;
+            }
+            
+            // 2. Copy the new token (at `pos`)
+            auto k_dst_new = temp_k_cache->slice(1, pos, pos + 1);
+            auto v_dst_new = temp_v_cache->slice(1, pos, pos + 1);
+            llaisys::ops::rearrange(k_dst_new, k_rope_slice);
+            llaisys::ops::rearrange(v_dst_new, v_view_slice);
             
             // Run Attention
-            auto k_cache = kv_cache.k(layer)->slice(0, 0, pos + 1);
-            auto v_cache = kv_cache.v(layer)->slice(0, 0, pos + 1);
-            
-            // attn_out slice
             auto attn_out_slice = batch_attn_out->slice(0, b, b+1)->view({1, _meta.nh, _meta.dh});
             
-            llaisys::ops::self_attention(attn_out_slice, q_rope_slice, k_cache, v_cache, _attn_scale);
+            llaisys::ops::self_attention(attn_out_slice, q_rope_slice, temp_k_cache, temp_v_cache, _attn_scale);
         }
 
         auto batch_attn_out_flat = batch_attn_out->view({batch, 1, _meta.hs});
@@ -446,19 +461,11 @@ void Qwen2Model::process_batch(const std::vector<Qwen2Session*> &sessions, const
     }
     
     // Final updates back to sessions
-    // We need to update session->_hidden for next step (if we keep state there)
-    // Actually, in continuous batching, the "state" passed between steps is KV Cache + last token.
-    // _hidden is scratchpad.
-    // BUT, we need to extract logits from batch_hidden at the end (outside this func or inside).
-    // Let's copy batch_hidden back to session->_hidden so the caller can use it for logits/sampling.
-    
     for (size_t b = 0; b < batch; ++b) {
         auto hidden_slice = batch_hidden->slice(0, b, b+1)->view({1, _meta.hs});
-        llaisys::ops::add(sessions[b]->_hidden, hidden_slice, nullptr); // Hacky copy using add(0+x) or just use rearrange?
-        // rearrange is robust copy
         llaisys::ops::rearrange(sessions[b]->_hidden, hidden_slice);
         
-        sessions[b]->kv_cache().advance(1);
+        sessions[b]->advance(1);
     }
 }
 
