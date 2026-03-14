@@ -14,11 +14,13 @@
 
 #include <cmath>
 
-#include <algorithm> // For std::max
-#include <iostream>
+#include <algorithm>
+#include <utility>
 
 namespace llaisys::models::qwen2 {
 namespace {
+constexpr size_t kKvBlockSize = 16;
+
 inline tensor_t unwrap(llaisysTensor_t handle) {
     if (!handle) {
         return nullptr;
@@ -38,6 +40,50 @@ void bind_layer_list(std::vector<tensor_t> &dst, llaisysTensor_t *src, size_t nl
         dst[i] = unwrap(src[i]);
     }
 }
+
+std::pair<tensor_t, tensor_t> gather_attention_cache(
+    Qwen2Session *session,
+    size_t layer,
+    size_t total_tokens,
+    tensor_t tail_k,
+    tensor_t tail_v,
+    llaisysDataType_t dtype,
+    llaisysDeviceType_t device,
+    int device_id,
+    size_t nkvhead,
+    size_t head_dim) {
+    auto gathered_k = Tensor::create({total_tokens, nkvhead, head_dim}, dtype, device, device_id);
+    auto gathered_v = Tensor::create({total_tokens, nkvhead, head_dim}, dtype, device, device_id);
+
+    size_t copied = 0;
+    for (const auto &block : session->blocks()) {
+        if (block->used == 0 || copied >= total_tokens) {
+            continue;
+        }
+
+        const size_t length = std::min(block->used, total_tokens - copied);
+        auto k_src = block->k_blocks[layer]->slice(0, 0, length);
+        auto v_src = block->v_blocks[layer]->slice(0, 0, length);
+        auto k_dst = gathered_k->slice(0, copied, copied + length);
+        auto v_dst = gathered_v->slice(0, copied, copied + length);
+
+        llaisys::ops::rearrange(k_dst, k_src);
+        llaisys::ops::rearrange(v_dst, v_src);
+        copied += length;
+    }
+
+    if (tail_k && tail_v) {
+        ASSERT(copied + 1 == total_tokens, "KV cache gather size mismatch");
+        auto k_tail_dst = gathered_k->slice(0, copied, copied + 1);
+        auto v_tail_dst = gathered_v->slice(0, copied, copied + 1);
+        llaisys::ops::rearrange(k_tail_dst, tail_k);
+        llaisys::ops::rearrange(v_tail_dst, tail_v);
+    } else {
+        ASSERT(copied == total_tokens, "KV cache gather size mismatch");
+    }
+
+    return {gathered_k, gathered_v};
+}
 } // namespace
 
 Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta, llaisysDeviceType_t device, int device_id)
@@ -52,6 +98,17 @@ Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta, llaisysDeviceType_t device,
     CHECK_ARGUMENT(_meta.nh * _meta.dh == _meta.hs, "nh * dh must equal hidden_size");
 
     _attn_scale = 1.0f / std::sqrt(static_cast<float>(_meta.dh));
+
+    const size_t num_blocks = std::max<size_t>((_meta.maxseq + kKvBlockSize - 1) / kKvBlockSize, 1);
+    _block_manager = std::make_shared<BlockManager>(
+        kKvBlockSize,
+        num_blocks,
+        _meta.nlayer,
+        _meta.nkvh,
+        _meta.dh,
+        _meta.dtype,
+        _device,
+        _device_id);
 }
 
 void Qwen2Model::bind_weights(const LlaisysQwen2Weights &weights) {
@@ -104,7 +161,7 @@ Qwen2Session *Qwen2Model::create_session() {
         _meta.voc,
         _meta.dtype
     };
-    return new Qwen2Session(config, _device, _device_id);
+    return new Qwen2Session(config, _device, _device_id, _block_manager);
 }
 
 int64_t Qwen2Model::infer(Qwen2Session *session, const int64_t *token_ids, size_t ntoken, int top_k, float top_p, float temperature, int64_t seed) {
@@ -116,17 +173,15 @@ int64_t Qwen2Model::infer(Qwen2Session *session, const int64_t *token_ids, size_
     }
     CHECK_ARGUMENT(ntoken <= _meta.maxseq, "ntoken exceeds maxseq");
 
-    auto &kv_cache = session->kv_cache();
-
-    if (kv_cache.seq_len() >= _meta.maxseq) {
-        kv_cache.reset();
+    if (session->seq_len() >= _meta.maxseq) {
+        session->reset();
     }
 
-    if (ntoken <= kv_cache.seq_len()) {
-        kv_cache.reset();
+    if (ntoken <= session->seq_len()) {
+        session->reset();
     }
 
-    for (size_t i = kv_cache.seq_len(); i < ntoken; ++i) {
+    for (size_t i = session->seq_len(); i < ntoken; ++i) {
         process_token(session, token_ids[i]);
     }
 
@@ -168,48 +223,30 @@ std::vector<int64_t> Qwen2Model::infer_batch(
         }
     }
 
-    std::vector<int64_t> current_token_ids(batch_size);
-    std::vector<bool> active(batch_size, true);
-
-    // Continuous Batching Loop
     for (size_t step = 0; step < max_steps; ++step) {
         bool any_active = false;
-        
-        // Prepare batch for this step
-        // In this simplified implementation, we only process one token per step for each active session
-        // If a session has multiple tokens (prefill phase), we process them one by one here
-        // Ideally, we should process all prompt tokens in one go (chunked prefill), but that requires more complex op support.
-        
         std::vector<Qwen2Session*> active_sessions;
         std::vector<int64_t> active_tokens;
-        std::vector<size_t> active_indices;
 
         for (size_t b = 0; b < batch_size; ++b) {
-            auto &kv_cache = sessions[b]->kv_cache();
-            
-            // Check if we need to reset cache (simplistic check)
-            if (kv_cache.seq_len() >= _meta.maxseq) {
-                 kv_cache.reset();
+            if (sessions[b]->seq_len() >= _meta.maxseq) {
+                sessions[b]->reset();
             }
-            if (batch_token_ids[b].size() <= kv_cache.seq_len() && step == 0) {
-                 // If providing prompt again, maybe reset? Assuming continuous generation, 
-                 // usually we only provide new tokens. 
-                 // If batch_token_ids contains full history, we need logic to skip processed.
-                 // Here we assume batch_token_ids ONLY contains NEW tokens to process.
-                 // So reset is manual or handled outside.
+            if (step == 0 && batch_token_ids[b].size() <= sessions[b]->seq_len()) {
+                sessions[b]->reset();
             }
 
             if (step < batch_token_ids[b].size()) {
                 active_sessions.push_back(sessions[b]);
                 active_tokens.push_back(batch_token_ids[b][step]);
-                active_indices.push_back(b);
                 any_active = true;
             }
         }
 
-        if (!any_active) break;
+        if (!any_active) {
+            break;
+        }
 
-        // Execute batch
         process_batch(active_sessions, active_tokens);
     }
     
@@ -240,75 +277,26 @@ std::vector<int64_t> Qwen2Model::infer_batch(
 
 void Qwen2Model::process_batch(const std::vector<Qwen2Session*> &sessions, const std::vector<int64_t> &token_ids) {
     size_t batch = sessions.size();
-    if (batch == 0) return;
+    if (batch == 0) {
+        return;
+    }
 
-    // 1. Prepare inputs
-    // We need to stack inputs from sessions into batch tensors
-    // Since we don't have a true "Stack" op or support for non-contiguous memory in ops easily,
-    // we might need to rely on the fact that ops now support batch if data is contiguous?
-    // BUT, our sessions have separate memory buffers.
-    // 
-    // OPTION A: Copy data to a temporary contiguous batch buffer. (Easier to implement now)
-    // OPTION B: Modify ops to accept vector<tensor_t>. (Cleanest but requires changing all ops)
-    // 
-    // Given the constraints and the previous modification to self_attention which accepts a single pointer + batch dim,
-    // it implies it expects CONTIGUOUS batch memory (or we need to change it to accept array of pointers).
-    // The previous self_attention modification used: `const T* q = q_base + b * q_stride;`
-    // This assumes q_base points to a large contiguous block [batch, qlen, ...].
-    // 
-    // HOWEVER, our sessions store data in separate `session->_hidden`, `session->_q_proj` etc.
-    // So we MUST copy them to a contiguous buffer to use the batch ops, OR modify ops to handle scattered data.
-    // Copying is expensive but simplest for "Continuous Batching" where batch size varies dynamically.
-    // 
-    // Let's implement a "Batch Tensor" manager or just simple buffers.
-    // For now, let's just do sequential processing in a loop inside this function to verify logic,
-    // OR implementing true batching requires allocating batch-sized temporary tensors.
-
-    // Let's implement TRUE batching by allocating batch buffers.
-    // Note: Allocating on every step is slow. Ideally these should be pre-allocated or pooled.
-    // For this educational project, let's create them on fly or use a static/cached buffer.
-    
-    // Actually, looking at `self_attention_cpu.cpp` modification:
-    // `const T* q = q_base + b * q_stride;`
-    // It strictly requires contiguous memory.
-    
-    // To support P4-3 efficiently, we should probably have a "BatchSession" or similar, 
-    // but here we are stitching individual sessions.
-    
-    // Let's alloc batch buffers.
-    
-    // Helper to create batch tensor
     auto create_batch_tensor = [&](const std::vector<size_t>& shape) {
         std::vector<size_t> batch_shape = shape;
         batch_shape.insert(batch_shape.begin(), batch);
         return Tensor::create(batch_shape, _meta.dtype, _device, _device_id);
     };
 
-    // We need batch versions of:
-    // _hidden, _attn_norm, _q/k/v_proj, _q/k/v_rope, _attn_out, _attn_proj, _mlp_*
-    
-    // Optimization: We can reuse one large buffer for all layer-wise operations if we are careful,
-    // but let's be explicit first.
-    
-    // NOTE: This implementation will be slow due to allocation/copy overhead, 
-    // but it demonstrates the correctness of batch ops.
-    // In production, we'd use a pre-allocated workspace.
-    
-    auto batch_hidden = create_batch_tensor({1, _meta.hs}); // [batch, 1, hs]
+    auto batch_hidden = create_batch_tensor({1, _meta.hs});
     auto batch_token_ids = Tensor::create({batch, 1}, LLAISYS_DTYPE_I64, _device, _device_id);
     auto batch_pos_ids = Tensor::create({batch, 1}, LLAISYS_DTYPE_I64, _device, _device_id);
 
-    // Copy inputs
     for (size_t b = 0; b < batch; ++b) {
-        int64_t tid = token_ids[b];
-        int64_t pos = static_cast<int64_t>(sessions[b]->kv_cache().seq_len());
-        
-        // Copy token/pos
-        // This is slow (H2D per element), but works
-        // Ideally we map memory.
+        const int64_t tid = token_ids[b];
+        const int64_t pos = static_cast<int64_t>(sessions[b]->seq_len());
         if (_device == LLAISYS_DEVICE_CPU) {
-            int64_t* t_ptr = (int64_t*)batch_token_ids->data();
-            int64_t* p_ptr = (int64_t*)batch_pos_ids->data();
+            auto *t_ptr = reinterpret_cast<int64_t *>(batch_token_ids->data());
+            auto *p_ptr = reinterpret_cast<int64_t *>(batch_pos_ids->data());
             t_ptr[b] = tid;
             p_ptr[b] = pos;
         }
@@ -316,12 +304,7 @@ void Qwen2Model::process_batch(const std::vector<Qwen2Session*> &sessions, const
 
     llaisys::ops::embedding(batch_hidden, batch_token_ids, _weights.in_embed);
 
-    // Loop layers
     for (size_t layer = 0; layer < _meta.nlayer; ++layer) {
-        // We need batch tensors for intermediate results
-        // To save memory, we can allocate them once outside loop? 
-        // Or just allocate inside for clarity now.
-        
         auto batch_attn_norm = create_batch_tensor({1, _meta.hs});
         llaisys::ops::rms_norm(batch_attn_norm, batch_hidden, _weights.attn_norm_w[layer], _meta.epsilon);
 
@@ -343,97 +326,30 @@ void Qwen2Model::process_batch(const std::vector<Qwen2Session*> &sessions, const
         llaisys::ops::rope(batch_q_rope, batch_q_view, batch_pos_ids, _meta.theta);
         llaisys::ops::rope(batch_k_rope, batch_k_view, batch_pos_ids, _meta.theta);
 
-        // KV Cache Update & Attention
-        // This is tricky: KV cache is scattered in sessions.
-        // We need to:
-        // 1. Copy new K/V to each session's cache (Scatter)
-        // 2. Prepare a "Batch KV Cache" for attention?
-        //    Self-attention needs [batch, kvlen, ...]. 
-        //    If kvlen differs per session (it does!), we have ragged inputs.
-        //    Standard implementation requires padding or FlashAttention-like handling.
-        //    
-        //    For simplicity in this project:
-        //    Since our `self_attention` op expects a contiguous 4D tensor [batch, kvlen, ...],
-        //    it implies all sessions must have SAME kvlen for it to work directly.
-        //    BUT continuous batching mixes different lengths.
-        //    
-        //    Workaround:
-        //    We cannot easily use the `self_attention` 4D op if lengths differ and memory is scattered.
-        //    
-        //    Backtrack:
-        //    If we want to use the Batch `self_attention`, we must construct a padded KV tensor.
-        //    OR
-        //    We just loop over batch for attention part (keeping other ops batched).
-        //    Since attention is heavy, this is suboptimal, but better than nothing.
-        //    
-        //    Let's try to batch what we can (Linear, Norm, Rope) and loop for Attention/Cache update.
-        //    Why? Because constructing a massive padded KV tensor is very expensive (copying all history).
-        
-        // Update individual caches & Run Attention individually
-        // (Unless we implement PagedAttention which is P4-4?)
-        
         auto batch_attn_out = create_batch_tensor({1, _meta.nh, _meta.dh});
-        
-        // This part runs sequentially per sample in batch
-        // We can parallelize this loop with OpenMP!
-        // But we need to be careful with memory.
-        
-        // Extract pointers to avoid tensor overhead in loop
-        if (_device == LLAISYS_DEVICE_CPU) {
-            // Need to map data back/forth if we were using GPU, but for CPU it's direct.
-            // We use the calculated Q/K/V Rope from batch tensors.
-        }
 
-        // For now, let's just loop.
         for (size_t b = 0; b < batch; ++b) {
-            // Ensure session has space for next token
             sessions[b]->ensure_capacity_for_next_token();
-            
-            int64_t pos = static_cast<int64_t>(sessions[b]->seq_len());
-            
-            // Extract slices from batch tensors
-            // q_rope: [batch, 1, nh, dh] -> slice(b, b+1)
+
+            const size_t pos = sessions[b]->seq_len();
             auto q_rope_slice = batch_q_rope->slice(0, b, b+1)->view({1, _meta.nh, _meta.dh});
             auto k_rope_slice = batch_k_rope->slice(0, b, b+1)->view({1, _meta.nkvh, _meta.dh});
             auto v_view_slice = batch_v_view->slice(0, b, b+1)->view({1, _meta.nkvh, _meta.dh});
-            
-            // Update Cache: Write to current block
+
             sessions[b]->write_kv(layer, k_rope_slice, v_view_slice);
-            
-            // Prepare inputs for Attention
-            // Since our self_attention op requires contiguous memory, we must gather blocks into a temp buffer.
-            // This is slow but necessary without PagedAttention op.
-            
-            // Allocate temp contiguous cache
-            // Shape: [1, pos + 1, nkvh, dh]
-            auto temp_k_cache = Tensor::create({1, static_cast<size_t>(pos + 1), _meta.nkvh, _meta.dh}, _meta.dtype, _device, _device_id);
-            auto temp_v_cache = Tensor::create({1, static_cast<size_t>(pos + 1), _meta.nkvh, _meta.dh}, _meta.dtype, _device, _device_id);
-            
-            // Gather from blocks
-            size_t current_offset = 0;
-            const auto& blocks = sessions[b]->blocks();
-            for (const auto& block : blocks) {
-                if (block->used == 0) continue;
-                 auto k_src = block->k_blocks[layer]->slice(0, 0, block->used);
-                 auto v_src = block->v_blocks[layer]->slice(0, 0, block->used);
-                 
-                 auto k_dst = temp_k_cache->slice(1, current_offset, current_offset + block->used);
-                 auto v_dst = temp_v_cache->slice(1, current_offset, current_offset + block->used);
-                 
-                 llaisys::ops::rearrange(k_dst, k_src);
-                 llaisys::ops::rearrange(v_dst, v_src);
-                 current_offset += block->used;
-            }
-            
-            // 2. Copy the new token (at `pos`)
-            auto k_dst_new = temp_k_cache->slice(1, pos, pos + 1);
-            auto v_dst_new = temp_v_cache->slice(1, pos, pos + 1);
-            llaisys::ops::rearrange(k_dst_new, k_rope_slice);
-            llaisys::ops::rearrange(v_dst_new, v_view_slice);
-            
-            // Run Attention
+
+            auto [temp_k_cache, temp_v_cache] = gather_attention_cache(
+                sessions[b],
+                layer,
+                pos + 1,
+                k_rope_slice,
+                v_view_slice,
+                _meta.dtype,
+                _device,
+                _device_id,
+                _meta.nkvh,
+                _meta.dh);
             auto attn_out_slice = batch_attn_out->slice(0, b, b+1)->view({1, _meta.nh, _meta.dh});
-            
             llaisys::ops::self_attention(attn_out_slice, q_rope_slice, temp_k_cache, temp_v_cache, _attn_scale);
         }
 
@@ -459,24 +375,23 @@ void Qwen2Model::process_batch(const std::vector<Qwen2Session*> &sessions, const
         llaisys::ops::linear(batch_mlp_down, batch_mlp_act, _weights.mlp_down_w[layer], nullptr);
         llaisys::ops::add(batch_hidden, batch_hidden, batch_mlp_down);
     }
-    
-    // Final updates back to sessions
+
     for (size_t b = 0; b < batch; ++b) {
         auto hidden_slice = batch_hidden->slice(0, b, b+1)->view({1, _meta.hs});
         llaisys::ops::rearrange(sessions[b]->_hidden, hidden_slice);
-        
         sessions[b]->advance(1);
     }
 }
 
 void Qwen2Model::process_token(Qwen2Session *session, int64_t token_id) {
-    auto &kv_cache = session->kv_cache();
-    int64_t pos = static_cast<int64_t>(kv_cache.seq_len());
+    const size_t pos = session->seq_len();
+    const int64_t pos_i64 = static_cast<int64_t>(pos);
 
     session->_token_ids->load(&token_id);
-    session->_pos_ids->load(&pos);
+    session->_pos_ids->load(&pos_i64);
 
     llaisys::ops::embedding(session->_hidden, session->_token_ids, _weights.in_embed);
+    session->ensure_capacity_for_next_token();
 
     for (size_t layer = 0; layer < _meta.nlayer; ++layer) {
         llaisys::ops::rms_norm(session->_attn_norm, session->_hidden, _weights.attn_norm_w[layer], _meta.epsilon);
@@ -488,13 +403,19 @@ void Qwen2Model::process_token(Qwen2Session *session, int64_t token_id) {
         llaisys::ops::rope(session->_q_rope, session->_q_view, session->_pos_ids, _meta.theta);
         llaisys::ops::rope(session->_k_rope, session->_k_view, session->_pos_ids, _meta.theta);
 
-        auto k_cache_slice = kv_cache.k(layer)->slice(0, pos, pos + 1);
-        auto v_cache_slice = kv_cache.v(layer)->slice(0, pos, pos + 1);
-        llaisys::ops::rearrange(k_cache_slice, session->_k_rope);
-        llaisys::ops::rearrange(v_cache_slice, session->_v_view);
+        session->write_kv(layer, session->_k_rope, session->_v_view);
 
-        auto k_cache = kv_cache.k(layer)->slice(0, 0, pos + 1);
-        auto v_cache = kv_cache.v(layer)->slice(0, 0, pos + 1);
+        auto [k_cache, v_cache] = gather_attention_cache(
+            session,
+            layer,
+            pos + 1,
+            session->_k_rope,
+            session->_v_view,
+            _meta.dtype,
+            _device,
+            _device_id,
+            _meta.nkvh,
+            _meta.dh);
 
         llaisys::ops::self_attention(session->_attn_out, session->_q_rope, k_cache, v_cache, _attn_scale);
         llaisys::ops::linear(session->_attn_proj, session->_attn_out_flat, _weights.attn_o_w[layer], nullptr);
@@ -508,7 +429,7 @@ void Qwen2Model::process_token(Qwen2Session *session, int64_t token_id) {
         llaisys::ops::add(session->_hidden, session->_hidden, session->_mlp_down);
     }
 
-    kv_cache.advance(1);
+    session->advance(1);
 }
 
 } // namespace llaisys::models::qwen2

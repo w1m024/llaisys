@@ -1,6 +1,6 @@
 #pragma once
 
-#include "llaisys/tensor.h"
+#include "../../tensor/tensor.hpp"
 #include <vector>
 #include <memory>
 #include <mutex>

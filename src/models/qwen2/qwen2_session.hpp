@@ -1,7 +1,7 @@
 #pragma once
 
-#include "llaisys/tensor.h"
-#include "qwen2_kv_cache.hpp" // New header for Block Manager
+#include "../../tensor/tensor.hpp"
+#include "qwen2_kv_cache.hpp"
 #include <memory>
 #include <vector>
 
@@ -13,34 +13,14 @@ class Qwen2Session {
 public:
     Qwen2Session(const Qwen2Config &config, llaisysDeviceType_t device, int device_id, std::shared_ptr<BlockManager> block_manager);
     ~Qwen2Session();
-
-    // Replaces contiguous KV Cache with Block-based access
-    // But for backward compatibility with existing ops (that expect tensor_t),
-    // we might need a way to present it as contiguous OR modify ops.
-    // For P4-4, we are moving to Paged Attention, so direct access via kv_cache() 
-    // returning a Qwen2KVCache object might need change.
-    
-    // Let's keep the old interface but implement it using blocks underneath?
-    // No, Qwen2KVCache was a simple struct holding tensors.
-    // Now session holds blocks directly.
     
     const std::vector<std::shared_ptr<KVCacheBlock>>& blocks() const { return _blocks; }
-    
-    // Add a new token to cache (allocates block if needed)
-    void append_token_kv(int layer, tensor_t k_slice, tensor_t v_slice);
-    
-    // Get total sequence length
+
     size_t seq_len() const { return _seq_len; }
-    
-    // Reserve slot for next token
+
     void ensure_capacity_for_next_token();
-    
-    // Write KV for specific layer to current slot
     void write_kv(int layer, tensor_t k_slice, tensor_t v_slice);
-    
-    // Advance sequence length
-    void advance(size_t n) { _seq_len += n; }
-    
+    void advance(size_t n);
     void reset();
 
     // Intermediate buffers (keep same)
@@ -74,9 +54,6 @@ private:
     std::shared_ptr<BlockManager> _block_manager;
     std::vector<std::shared_ptr<KVCacheBlock>> _blocks;
     size_t _seq_len = 0;
-    
-    // For now, remove the old Qwen2KVCache member
-    // Qwen2KVCache _kv_cache; 
 };
 
 } // namespace llaisys::models::qwen2

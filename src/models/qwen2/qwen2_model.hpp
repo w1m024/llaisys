@@ -6,6 +6,7 @@
 
 #include "llaisys/models/qwen2.h"
 
+#include <memory>
 #include <vector>
 
 namespace llaisys::models::qwen2 {
@@ -73,6 +74,7 @@ private:
     int _device_id;
     Qwen2Weights _weights;
     bool _weights_bound = false;
+    std::shared_ptr<BlockManager> _block_manager;
 
     float _attn_scale = 1.0f;
 };
