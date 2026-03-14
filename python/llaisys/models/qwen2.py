@@ -1,4 +1,4 @@
-from typing import Sequence, Dict
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 from pathlib import Path
 import json
 import ctypes
@@ -8,7 +8,11 @@ import safetensors
 
 from ..libllaisys import LIB_LLAISYS
 from ..libllaisys import DeviceType, DataType
-from ..libllaisys.models import LlaisysQwen2Meta, LlaisysQwen2Weights
+from ..libllaisys.models import (
+    LlaisysQwen2Meta,
+    LlaisysQwen2Weights,
+    llaisysQwen2Session_t,
+)
 from ..tensor import Tensor
 
 
@@ -264,13 +268,7 @@ class Qwen2:
             List of token IDs (full sequence) or Iterator[int] (new tokens only)
         """
         if session is None:
-            # For backward compatibility / ease of use
-            # But note: this session is temporary and won't persist history across calls
-            # unless user manages it.
-            session = self.create_session()
-            # If not streaming, we might want to auto-destroy? 
-            # But Python GC will handle it if we don't return it.
-            # Let's keep it simple.
+            session = self._default_session
 
         session_handle = session._handle if hasattr(session, "_handle") else session
 
@@ -301,7 +299,7 @@ class Qwen2:
             return []
             
         # Prepare C arrays
-        session_ptrs = (ctypes.POINTER(ctypes.c_void_p) * batch_size)()
+        session_ptrs = (llaisysQwen2Session_t * batch_size)()
         token_ptrs = (ctypes.POINTER(ctypes.c_int64) * batch_size)()
         ntokens_arr = (ctypes.c_size_t * batch_size)()
         
@@ -313,7 +311,7 @@ class Qwen2:
             s = sessions[i]
             if hasattr(s, "_handle"):
                 s = s._handle
-            session_ptrs[i] = ctypes.cast(s, ctypes.POINTER(ctypes.c_void_p))
+            session_ptrs[i] = s
             
             tokens = batch_input_ids[i]
             n = len(tokens)
@@ -331,7 +329,7 @@ class Qwen2:
         
         LIB_LLAISYS.llaisysQwen2ModelInferBatch(
             self._model,
-            ctypes.cast(session_ptrs, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))),
+            session_ptrs,
             token_ptrs,
             ntokens_arr,
             ctypes.c_int(batch_size),
