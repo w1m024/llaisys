@@ -1,14 +1,12 @@
-import os
 import time
 import uuid
-import json
 import asyncio
-from typing import List, Optional, Union, Dict, Any
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from transformers import AutoTokenizer
 
@@ -19,33 +17,39 @@ from llaisys import DeviceType
 # Global State & Configuration
 # ==============================================================================
 
+@dataclass
+class SessionState:
+    session: Any
+    cache_token_ids: List[int] = field(default_factory=list)
+    in_flight: bool = False
+
 class InferenceRequest:
     def __init__(self, 
                  input_ids: List[int], 
                  generation_config: Dict[str, Any],
                  response_queue: asyncio.Queue,
-                 session_id: Optional[str] = None):
+                 session_state: SessionState,
+                 session_id: Optional[str] = None,
+                 persistent: bool = False):
         self.input_ids = input_ids # Remaining prompt tokens to be processed
         self.generation_config = generation_config
         self.response_queue = response_queue
+        self.session_state = session_state
         self.session_id = session_id
+        self.persistent = persistent
         self.created_at = time.time()
         self.generated_len = 0 # How many new tokens generated
         self.finished = False
-        self.session = None # Assigned session object
+        self.last_token: Optional[int] = None
 
 class GlobalState:
     model: Optional[llaisys.models.Qwen2] = None
     tokenizer: Optional[AutoTokenizer] = None
     model_path: str = "/home/wsl/model/DeepSeek-R1-Distill-Qwen-1.5B"  # Default path
-    session_store: Dict[str, Any] = {}
+    session_store: Dict[str, SessionState] = {}
     request_queue: asyncio.Queue = None # Initialize in lifespan
     
 state = GlobalState()
-
-# Lock for model access (Project #3 Requirement)
-# Even with worker, we need to protect model if multiple workers exist (though we use 1 worker for now)
-generation_lock = asyncio.Lock()
 
 # ==============================================================================
 # Data Models (OpenAI Compatible)
@@ -130,64 +134,23 @@ async def worker_loop():
             top_ps = []
             temperatures = []
             seeds = []
+            consumed_inputs = []
             
             requests_to_remove = []
             
             for req in active_requests:
-                # Initialize session if needed
-                if req.session is None:
-                    if req.session_id and req.session_id in state.session_store:
-                        req.session = state.session_store[req.session_id]
-                    else:
-                        # Create new session
-                        # Ideally lock here if needed, but model ops are safe now? 
-                        # create_session is C++ allocation, should be fast.
-                        req.session = state.model.create_session()
-                        if req.session_id:
-                            state.session_store[req.session_id] = req.session
-                
-                sessions.append(req.session)
-                
-                # Determine input for this step
-                # If we have unprocessed prompt tokens, feed them (Prefill)
-                # Note: Our current infer_batch only supports 1 token step per session effectively
-                # because we didn't implement chunked prefill in C++ (it loops).
-                # So we feed 1 token at a time even for prompt.
-                # Optimization: In real system, we'd feed all prompt tokens at once.
-                # Here, we treat prompt as just a sequence of tokens to force feed.
-                
-                if len(req.input_ids) > 0:
-                    # Prefill phase: feed next token from prompt
-                    # But wait, Qwen2Model::infer_batch implementation loops `step < batch_token_ids[b].size()`
-                    # So we CAN feed multiple tokens!
-                    # However, if we feed multiple, we get multiple outputs? 
-                    # Our infer_batch implementation only samples ONE token at the end of the sequence provided.
-                    # So for prefill, we should provide the WHOLE prompt, but we only care about the last output?
-                    # NO. The prompt tokens are INPUTS. The model generates ONE token after them.
-                    # So we should provide ALL remaining prompt tokens.
-                    
-                    next_tokens = req.input_ids
-                    # We consume all prompt tokens in one go
-                    req.input_ids = [] 
-                    batch_input_ids.append(next_tokens)
+                sessions.append(req.session_state.session)
+
+                if req.input_ids:
+                    next_tokens = list(req.input_ids)
+                    req.input_ids = []
+                elif req.last_token is not None:
+                    next_tokens = [req.last_token]
                 else:
-                    # Decode phase: we rely on the PREVIOUS output token being in the KV cache?
-                    # Wait, our generate_batch API expects INPUT tokens.
-                    # If we just generated a token in previous step, we need to feed it back!
-                    # BUT `generate_batch` returns the NEW token.
-                    # We need to store it and feed it in next step.
-                    
-                    # ISSUE: `InferenceRequest` needs to store the `last_token` to feed in next step.
-                    # In standard generate(), this is handled by the loop.
-                    # Here we must manage it manually.
-                    
-                    if hasattr(req, 'last_token'):
-                        batch_input_ids.append([req.last_token])
-                    else:
-                        # Should not happen if logic is correct
-                        # Unless prompt was empty?
-                        batch_input_ids.append([state.model._meta.end_token]) # Dummy?
-                        
+                    raise RuntimeError("Request has no tokens to process and no cached decode token")
+
+                batch_input_ids.append(next_tokens)
+                consumed_inputs.append(next_tokens)
                 top_ks.append(req.generation_config["top_k"])
                 top_ps.append(req.generation_config["top_p"])
                 temperatures.append(req.generation_config["temperature"])
@@ -210,6 +173,7 @@ async def worker_loop():
             
             # 4. Process Results
             for i, req in enumerate(active_requests):
+                req.session_state.cache_token_ids.extend(consumed_inputs[i])
                 new_token = new_tokens[i]
                 req.last_token = new_token
                 req.generated_len += 1
@@ -225,9 +189,8 @@ async def worker_loop():
                     await req.response_queue.put({"done": True})
                     req.finished = True
                     requests_to_remove.append(req)
+                    _cleanup_request(req)
                     
-                    # Mark task done in global queue if it came from there
-                    # (Though we already took it out)
                     try:
                         state.request_queue.task_done()
                     except ValueError:
@@ -241,12 +204,19 @@ async def worker_loop():
             await asyncio.sleep(0)
             
         except asyncio.CancelledError:
+            for req in active_requests:
+                await req.response_queue.put({"error": "Worker cancelled"})
+                _cleanup_request(req, discard_session=req.persistent)
             print("Worker loop cancelled.")
             break
         except Exception as e:
             print(f"Worker loop error: {e}")
             import traceback
             traceback.print_exc()
+            for req in active_requests:
+                await req.response_queue.put({"error": str(e)})
+                _cleanup_request(req, discard_session=req.persistent)
+            active_requests.clear()
             await asyncio.sleep(1)
 
 # ==============================================================================
@@ -280,6 +250,10 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    for session_state in list(state.session_store.values()):
+        _destroy_session(session_state)
+    state.session_store.clear()
+
 app = FastAPI(title="LLAISYS Chatbot Server", lifespan=lifespan)
 
 # ==============================================================================
@@ -288,6 +262,47 @@ app = FastAPI(title="LLAISYS Chatbot Server", lifespan=lifespan)
 
 def _format_sse(data: BaseModel) -> str:
     return data.model_dump_json()
+
+
+def _is_prefix(prefix: List[int], tokens: List[int]) -> bool:
+    return len(prefix) <= len(tokens) and tokens[: len(prefix)] == prefix
+
+
+def _destroy_session(session_state: SessionState):
+    if state.model is None:
+        return
+    state.model.destroy_session(session_state.session)
+
+
+def _cleanup_request(req: InferenceRequest, discard_session: bool = False):
+    req.session_state.in_flight = False
+    if discard_session or not req.persistent:
+        _destroy_session(req.session_state)
+        if req.session_id:
+            state.session_store.pop(req.session_id, None)
+
+
+def _prepare_session(prompt_ids: List[int], session_id: Optional[str]) -> tuple[SessionState, List[int], bool]:
+    if not session_id:
+        session_state = SessionState(session=state.model.create_session(), in_flight=True)
+        return session_state, list(prompt_ids), False
+
+    session_state = state.session_store.get(session_id)
+    if session_state and session_state.in_flight:
+        raise HTTPException(status_code=409, detail=f"Session '{session_id}' is busy")
+
+    if session_state and _is_prefix(session_state.cache_token_ids, prompt_ids):
+        delta_ids = prompt_ids[len(session_state.cache_token_ids):]
+        if delta_ids:
+            session_state.in_flight = True
+            return session_state, delta_ids, True
+
+    if session_state:
+        _destroy_session(session_state)
+
+    session_state = SessionState(session=state.model.create_session(), in_flight=True)
+    state.session_store[session_id] = session_state
+    return session_state, list(prompt_ids), True
 
 # ==============================================================================
 # API Endpoints
@@ -321,12 +336,15 @@ async def chat_completions(request: ChatCompletionRequest):
         "temperature": request.temperature,
         "seed": request.seed if request.seed is not None else -1
     }
+    session_state, delta_input_ids, persistent = _prepare_session(input_ids, request.session_id)
     
     req = InferenceRequest(
-        input_ids=input_ids,
+        input_ids=delta_input_ids,
         generation_config=gen_config,
         response_queue=response_queue,
-        session_id=request.session_id
+        session_state=session_state,
+        session_id=request.session_id,
+        persistent=persistent,
     )
 
     # 3. Put into Queue
@@ -352,8 +370,7 @@ async def chat_completions(request: ChatCompletionRequest):
             item = await response_queue.get()
             
             if "error" in item:
-                # Handle error (maybe send a special event or just log)
-                print(f"Error from worker: {item['error']}")
+                yield {"event": "error", "data": item["error"]}
                 break
                 
             if "done" in item:
@@ -393,6 +410,7 @@ async def chat_completions(request: ChatCompletionRequest):
     else:
         # Non-stream: Accumulate all tokens
         content = ""
+        completion_tokens = 0
         while True:
             item = await response_queue.get()
             if "error" in item:
@@ -400,12 +418,13 @@ async def chat_completions(request: ChatCompletionRequest):
             if "done" in item:
                 break
             token_id = item["token_id"]
+            completion_tokens += 1
             content += state.tokenizer.decode([token_id], skip_special_tokens=True)
 
         usage = {
             "prompt_tokens": len(input_ids),
-            "completion_tokens": 0, # TODO: count tokens
-            "total_tokens": 0
+            "completion_tokens": completion_tokens,
+            "total_tokens": len(input_ids) + completion_tokens,
         }
 
         return ChatCompletionResponse(
