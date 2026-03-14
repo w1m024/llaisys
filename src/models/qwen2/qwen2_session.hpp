@@ -19,6 +19,7 @@ public:
     size_t seq_len() const { return _seq_len; }
 
     void ensure_capacity_for_next_token();
+    void load_prefix(const std::vector<std::shared_ptr<KVCacheBlock>> &blocks, size_t seq_len, tensor_t hidden);
     void write_kv(int layer, tensor_t k_slice, tensor_t v_slice);
     void advance(size_t n);
     void reset();

@@ -6,7 +6,10 @@
 
 #include "llaisys/models/qwen2.h"
 
+#include <list>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace llaisys::models::qwen2 {
@@ -65,6 +68,15 @@ public:
     );
 
 private:
+    struct PrefixCacheEntry {
+        std::vector<int64_t> token_ids;
+        std::vector<std::shared_ptr<KVCacheBlock>> blocks;
+        tensor_t hidden;
+    };
+
+    std::shared_ptr<PrefixCacheEntry> find_prefix_cache(const int64_t *token_ids, size_t ntoken);
+    void update_prefix_cache(Qwen2Session *session, const int64_t *token_ids, size_t ntoken);
+
     void process_token(Qwen2Session *session, int64_t token_id);
     // Batch processing helper
     void process_batch(const std::vector<Qwen2Session*> &sessions, const std::vector<int64_t> &token_ids);
@@ -75,6 +87,10 @@ private:
     Qwen2Weights _weights;
     bool _weights_bound = false;
     std::shared_ptr<BlockManager> _block_manager;
+    std::unordered_map<size_t, std::shared_ptr<PrefixCacheEntry>> _prefix_cache;
+    std::list<size_t> _prefix_cache_order;
+    std::mutex _prefix_cache_mutex;
+    size_t _prefix_cache_capacity = 32;
 
     float _attn_scale = 1.0f;
 };

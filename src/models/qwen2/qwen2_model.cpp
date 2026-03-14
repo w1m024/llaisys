@@ -15,11 +15,13 @@
 #include <cmath>
 
 #include <algorithm>
+#include <functional>
 #include <utility>
 
 namespace llaisys::models::qwen2 {
 namespace {
 constexpr size_t kKvBlockSize = 16;
+constexpr size_t kPrefixCacheSeed = 0x9e3779b97f4a7c15ULL;
 
 inline tensor_t unwrap(llaisysTensor_t handle) {
     if (!handle) {
@@ -39,6 +41,68 @@ void bind_layer_list(std::vector<tensor_t> &dst, llaisysTensor_t *src, size_t nl
     for (size_t i = 0; i < nlayer; ++i) {
         dst[i] = unwrap(src[i]);
     }
+}
+
+size_t hash_token_prefix(size_t seed, int64_t token_id) {
+    size_t token_hash = std::hash<int64_t>{}(token_id);
+    return seed ^ (token_hash + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
+}
+
+std::vector<size_t> build_prefix_hashes(const int64_t *token_ids, size_t ntoken) {
+    std::vector<size_t> hashes;
+    hashes.reserve(ntoken);
+
+    size_t rolling_hash = kPrefixCacheSeed;
+    for (size_t i = 0; i < ntoken; ++i) {
+        rolling_hash = hash_token_prefix(rolling_hash, token_ids[i]);
+        hashes.push_back(rolling_hash);
+    }
+
+    return hashes;
+}
+
+void copy_block_data(const std::shared_ptr<KVCacheBlock> &dst, const std::shared_ptr<KVCacheBlock> &src) {
+    CHECK_ARGUMENT(dst != nullptr && src != nullptr, "null KV cache block");
+    CHECK_ARGUMENT(dst->k_blocks.size() == src->k_blocks.size(), "KV cache layer count mismatch");
+    CHECK_ARGUMENT(dst->used == 0, "destination KV cache block must be empty");
+
+    if (src->used > 0) {
+        for (size_t layer = 0; layer < src->k_blocks.size(); ++layer) {
+            auto k_src = src->k_blocks[layer]->slice(0, 0, src->used);
+            auto v_src = src->v_blocks[layer]->slice(0, 0, src->used);
+            auto k_dst = dst->k_blocks[layer]->slice(0, 0, src->used);
+            auto v_dst = dst->v_blocks[layer]->slice(0, 0, src->used);
+
+            llaisys::ops::rearrange(k_dst, k_src);
+            llaisys::ops::rearrange(v_dst, v_src);
+        }
+    }
+
+    dst->used = src->used;
+    dst->content_hash = src->content_hash;
+}
+
+std::shared_ptr<KVCacheBlock> clone_block_snapshot(const std::shared_ptr<KVCacheBlock> &src) {
+    CHECK_ARGUMENT(src != nullptr, "null KV cache block");
+    CHECK_ARGUMENT(!src->k_blocks.empty(), "empty KV cache block");
+
+    const size_t nlayer = src->k_blocks.size();
+    const size_t nkvhead = src->k_blocks[0]->shape()[1];
+    const size_t head_dim = src->k_blocks[0]->shape()[2];
+    const auto dtype = src->k_blocks[0]->dtype();
+    const auto device = src->k_blocks[0]->deviceType();
+    const int device_id = src->k_blocks[0]->deviceId();
+
+    auto cloned = std::make_shared<KVCacheBlock>(src->id, src->size, nlayer, nkvhead, head_dim, dtype, device, device_id);
+    copy_block_data(cloned, src);
+    return cloned;
+}
+
+tensor_t clone_tensor_snapshot(tensor_t tensor) {
+    CHECK_ARGUMENT(tensor != nullptr, "null tensor snapshot");
+    auto snapshot = Tensor::create(tensor->shape(), tensor->dtype(), tensor->deviceType(), tensor->deviceId());
+    llaisys::ops::rearrange(snapshot, tensor);
+    return snapshot;
 }
 
 std::pair<tensor_t, tensor_t> gather_attention_cache(
@@ -164,6 +228,59 @@ Qwen2Session *Qwen2Model::create_session() {
     return new Qwen2Session(config, _device, _device_id, _block_manager);
 }
 
+std::shared_ptr<Qwen2Model::PrefixCacheEntry> Qwen2Model::find_prefix_cache(const int64_t *token_ids, size_t ntoken) {
+    if (!token_ids || ntoken == 0) {
+        return nullptr;
+    }
+
+    const auto prefix_hashes = build_prefix_hashes(token_ids, ntoken);
+    std::lock_guard<std::mutex> lock(_prefix_cache_mutex);
+
+    for (size_t len = ntoken; len > 0; --len) {
+        auto it = _prefix_cache.find(prefix_hashes[len - 1]);
+        if (it == _prefix_cache.end()) {
+            continue;
+        }
+
+        const auto &entry = it->second;
+        if (!entry || entry->token_ids.size() != len) {
+            continue;
+        }
+        if (std::equal(entry->token_ids.begin(), entry->token_ids.end(), token_ids)) {
+            return entry;
+        }
+    }
+
+    return nullptr;
+}
+
+void Qwen2Model::update_prefix_cache(Qwen2Session *session, const int64_t *token_ids, size_t ntoken) {
+    if (!session || !token_ids || ntoken == 0 || session->seq_len() != ntoken) {
+        return;
+    }
+
+    auto entry = std::make_shared<PrefixCacheEntry>();
+    entry->token_ids.assign(token_ids, token_ids + ntoken);
+    entry->blocks.reserve(session->blocks().size());
+    for (const auto &block : session->blocks()) {
+        entry->blocks.push_back(clone_block_snapshot(block));
+    }
+    entry->hidden = clone_tensor_snapshot(session->_hidden);
+
+    const size_t hash = build_prefix_hashes(token_ids, ntoken).back();
+
+    std::lock_guard<std::mutex> lock(_prefix_cache_mutex);
+    _prefix_cache_order.remove(hash);
+    _prefix_cache[hash] = entry;
+    _prefix_cache_order.push_back(hash);
+
+    while (_prefix_cache_order.size() > _prefix_cache_capacity) {
+        const size_t oldest_hash = _prefix_cache_order.front();
+        _prefix_cache_order.pop_front();
+        _prefix_cache.erase(oldest_hash);
+    }
+}
+
 int64_t Qwen2Model::infer(Qwen2Session *session, const int64_t *token_ids, size_t ntoken, int top_k, float top_p, float temperature, int64_t seed) {
     CHECK_ARGUMENT(session, "session is null");
     CHECK_ARGUMENT(token_ids || ntoken == 0, "token_ids is null");
@@ -173,16 +290,30 @@ int64_t Qwen2Model::infer(Qwen2Session *session, const int64_t *token_ids, size_
     }
     CHECK_ARGUMENT(ntoken <= _meta.maxseq, "ntoken exceeds maxseq");
 
+    bool cacheable_prompt = false;
     if (session->seq_len() >= _meta.maxseq) {
         session->reset();
     }
 
-    if (ntoken <= session->seq_len()) {
+    if (session->seq_len() == 0) {
+        cacheable_prompt = true;
+    } else if (ntoken <= session->seq_len()) {
         session->reset();
+        cacheable_prompt = true;
+    }
+
+    if (cacheable_prompt) {
+        if (auto cached_entry = find_prefix_cache(token_ids, ntoken)) {
+            session->load_prefix(cached_entry->blocks, cached_entry->token_ids.size(), cached_entry->hidden);
+        }
     }
 
     for (size_t i = session->seq_len(); i < ntoken; ++i) {
         process_token(session, token_ids[i]);
+    }
+
+    if (cacheable_prompt && session->seq_len() == ntoken) {
+        update_prefix_cache(session, token_ids, ntoken);
     }
 
     llaisys::ops::rms_norm(session->_final_norm, session->_hidden, _weights.out_norm_w, _meta.epsilon);
@@ -223,20 +354,33 @@ std::vector<int64_t> Qwen2Model::infer_batch(
         }
     }
 
+    std::vector<bool> cacheable_prompts(batch_size, false);
+    for (size_t b = 0; b < batch_size; ++b) {
+        if (sessions[b]->seq_len() >= _meta.maxseq) {
+            sessions[b]->reset();
+        }
+
+        if (sessions[b]->seq_len() == 0) {
+            cacheable_prompts[b] = true;
+        } else if (batch_token_ids[b].size() <= sessions[b]->seq_len()) {
+            sessions[b]->reset();
+            cacheable_prompts[b] = true;
+        }
+
+        if (cacheable_prompts[b] && !batch_token_ids[b].empty()) {
+            if (auto cached_entry = find_prefix_cache(batch_token_ids[b].data(), batch_token_ids[b].size())) {
+                sessions[b]->load_prefix(cached_entry->blocks, cached_entry->token_ids.size(), cached_entry->hidden);
+            }
+        }
+    }
+
     for (size_t step = 0; step < max_steps; ++step) {
         bool any_active = false;
         std::vector<Qwen2Session*> active_sessions;
         std::vector<int64_t> active_tokens;
 
         for (size_t b = 0; b < batch_size; ++b) {
-            if (sessions[b]->seq_len() >= _meta.maxseq) {
-                sessions[b]->reset();
-            }
-            if (step == 0 && batch_token_ids[b].size() <= sessions[b]->seq_len()) {
-                sessions[b]->reset();
-            }
-
-            if (step < batch_token_ids[b].size()) {
+            if (step >= sessions[b]->seq_len() && step < batch_token_ids[b].size()) {
                 active_sessions.push_back(sessions[b]);
                 active_tokens.push_back(batch_token_ids[b][step]);
                 any_active = true;
@@ -258,6 +402,10 @@ std::vector<int64_t> Qwen2Model::infer_batch(
         if (batch_token_ids[b].empty()) continue;
 
         auto *session = sessions[b];
+
+        if (cacheable_prompts[b] && session->seq_len() == batch_token_ids[b].size()) {
+            update_prefix_cache(session, batch_token_ids[b].data(), batch_token_ids[b].size());
+        }
         
         llaisys::ops::rms_norm(session->_final_norm, session->_hidden, _weights.out_norm_w, _meta.epsilon);
         llaisys::ops::linear(session->_logits, session->_final_norm, _weights.out_embed, nullptr);

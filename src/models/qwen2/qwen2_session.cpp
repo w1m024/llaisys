@@ -63,6 +63,36 @@ void Qwen2Session::ensure_capacity_for_next_token() {
     }
 }
 
+void Qwen2Session::load_prefix(const std::vector<std::shared_ptr<KVCacheBlock>> &blocks, size_t seq_len, tensor_t hidden) {
+    reset();
+
+    for (const auto &source_block : blocks) {
+        auto cloned_block = _block_manager->allocate();
+        CHECK_ARGUMENT(cloned_block != nullptr, "OOM: Failed to allocate KV Cache block for prefix cache");
+        CHECK_ARGUMENT(cloned_block->size >= source_block->used, "prefix cache block size mismatch");
+        CHECK_ARGUMENT(cloned_block->k_blocks.size() == source_block->k_blocks.size(), "prefix cache layer count mismatch");
+
+        if (source_block->used > 0) {
+            for (size_t layer = 0; layer < source_block->k_blocks.size(); ++layer) {
+                auto k_src = source_block->k_blocks[layer]->slice(0, 0, source_block->used);
+                auto v_src = source_block->v_blocks[layer]->slice(0, 0, source_block->used);
+                auto k_dst = cloned_block->k_blocks[layer]->slice(0, 0, source_block->used);
+                auto v_dst = cloned_block->v_blocks[layer]->slice(0, 0, source_block->used);
+                llaisys::ops::rearrange(k_dst, k_src);
+                llaisys::ops::rearrange(v_dst, v_src);
+            }
+        }
+
+        cloned_block->used = source_block->used;
+        _blocks.push_back(cloned_block);
+    }
+
+    _seq_len = seq_len;
+    if (hidden != nullptr && seq_len > 0) {
+        llaisys::ops::rearrange(_hidden, hidden);
+    }
+}
+
 void Qwen2Session::write_kv(int layer, tensor_t k_slice, tensor_t v_slice) {
     CHECK_ARGUMENT(!_blocks.empty(), "KV cache block is missing");
     auto current_block = _blocks.back();
