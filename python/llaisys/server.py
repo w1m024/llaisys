@@ -1,6 +1,7 @@
+import asyncio
+import argparse
 import time
 import uuid
-import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
@@ -50,7 +51,7 @@ class InferenceRequest:
 class GlobalState:
     model: Optional[llaisys.models.Qwen2] = None
     tokenizer: Optional[AutoTokenizer] = None
-    model_path: str = "/home/wsl/model/DeepSeek-R1-Distill-Qwen-1.5B"  # Default path
+    model_path: Optional[str] = None
     session_store: Dict[str, SessionState] = {}
     request_queue: asyncio.Queue = None # Initialize in lifespan
     
@@ -257,17 +258,42 @@ async def worker_loop():
 # Lifespan & App Initialization
 # ==============================================================================
 
+def configure_model_path(model_path: str) -> str:
+    resolved = Path(model_path).expanduser().resolve()
+    state.model_path = str(resolved)
+    return state.model_path
+
+
+def _resolve_model_path() -> str:
+    if not state.model_path:
+        raise RuntimeError(
+            "Model path is required. Start the server with "
+            "`python -m llaisys.server --model /abs/path/to/qwen2` "
+            "or call `llaisys.server.configure_model_path(...)` before running uvicorn."
+        )
+
+    model_path = Path(state.model_path).expanduser().resolve()
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model path not found: {model_path}")
+    if not model_path.is_dir():
+        raise NotADirectoryError(f"Model path is not a directory: {model_path}")
+
+    state.model_path = str(model_path)
+    return state.model_path
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Initialize Queues
     state.request_queue = asyncio.Queue()
 
     # Startup: Load Model
-    print(f"Loading tokenizer from {state.model_path}...")
-    state.tokenizer = AutoTokenizer.from_pretrained(state.model_path, trust_remote_code=True)
+    model_path = _resolve_model_path()
+
+    print(f"Loading tokenizer from {model_path}...")
+    state.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     
-    print(f"Loading LLAISYS model from {state.model_path}...")
-    state.model = llaisys.models.Qwen2(state.model_path, DeviceType.CPU)
+    print(f"Loading LLAISYS model from {model_path}...")
+    state.model = llaisys.models.Qwen2(model_path, DeviceType.CPU)
     
     print("Model loaded successfully!")
 
@@ -541,6 +567,26 @@ async def chat_completions(request: ChatCompletionRequest):
             usage=usage
         )
 
-if __name__ == "__main__":
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="LLAISYS FastAPI server")
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="Path to the local Qwen2 model directory.",
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="Server bind host.")
+    parser.add_argument("--port", type=int, default=8000, help="Server bind port.")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None):
+    args = parse_args(argv)
+    configure_model_path(args.model)
+
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()

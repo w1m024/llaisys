@@ -127,6 +127,28 @@ def test_chat_completions_batches_concurrent_requests():
     asyncio.run(scenario())
 
 
+def test_resolve_model_path_requires_explicit_configuration():
+    original_model_path = server.state.model_path
+    server.state.model_path = None
+
+    try:
+        with pytest.raises(RuntimeError, match="Model path is required"):
+            server._resolve_model_path()
+    finally:
+        server.state.model_path = original_model_path
+
+
+def test_configure_model_path_normalizes_explicit_path(tmp_path):
+    original_model_path = server.state.model_path
+
+    try:
+        resolved = server.configure_model_path(str(tmp_path))
+        assert resolved == str(tmp_path.resolve())
+        assert server.state.model_path == str(tmp_path.resolve())
+    finally:
+        server.state.model_path = original_model_path
+
+
 def test_chat_format_normalizes_prefilled_think_output():
     assert assistant_prefills_think("prefix<think>\n") is True
     assert normalize_assistant_text("reasoning</think>answer", True) == "<think>\nreasoning</think>answer"
