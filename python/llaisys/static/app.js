@@ -859,6 +859,14 @@ function installEventHandlers() {
             await submitPrompt(elements.composerInput.value);
         }
     });
+
+    window.addEventListener("storage", (event) => {
+        if (event.key !== STORAGE_KEY) {
+            return;
+        }
+        loadState();
+        render();
+    });
 }
 
 loadState();
