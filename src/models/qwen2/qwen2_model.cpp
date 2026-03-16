@@ -429,15 +429,13 @@ void Qwen2Model::process_batch(const std::vector<Qwen2Session*> &sessions, const
         return;
     }
 
-    auto create_batch_tensor = [&](const std::vector<size_t>& shape) {
-        std::vector<size_t> batch_shape = shape;
-        batch_shape.insert(batch_shape.begin(), batch);
-        return Tensor::create(batch_shape, _meta.dtype, _device, _device_id);
+    auto create_batch_matrix = [&](size_t dim) {
+        return Tensor::create({batch, dim}, _meta.dtype, _device, _device_id);
     };
 
-    auto batch_hidden = create_batch_tensor({1, _meta.hs});
-    auto batch_token_ids = Tensor::create({batch, 1}, LLAISYS_DTYPE_I64, _device, _device_id);
-    auto batch_pos_ids = Tensor::create({batch, 1}, LLAISYS_DTYPE_I64, _device, _device_id);
+    auto batch_hidden = create_batch_matrix(_meta.hs);
+    auto batch_token_ids = Tensor::create({batch}, LLAISYS_DTYPE_I64, _device, _device_id);
+    auto batch_pos_ids = Tensor::create({batch}, LLAISYS_DTYPE_I64, _device, _device_id);
 
     for (size_t b = 0; b < batch; ++b) {
         const int64_t tid = token_ids[b];
@@ -453,28 +451,28 @@ void Qwen2Model::process_batch(const std::vector<Qwen2Session*> &sessions, const
     llaisys::ops::embedding(batch_hidden, batch_token_ids, _weights.in_embed);
 
     for (size_t layer = 0; layer < _meta.nlayer; ++layer) {
-        auto batch_attn_norm = create_batch_tensor({1, _meta.hs});
+        auto batch_attn_norm = create_batch_matrix(_meta.hs);
         llaisys::ops::rms_norm(batch_attn_norm, batch_hidden, _weights.attn_norm_w[layer], _meta.epsilon);
 
-        auto batch_q_proj = create_batch_tensor({1, _meta.nh * _meta.dh});
-        auto batch_k_proj = create_batch_tensor({1, _meta.nkvh * _meta.dh});
-        auto batch_v_proj = create_batch_tensor({1, _meta.nkvh * _meta.dh});
+        auto batch_q_proj = create_batch_matrix(_meta.nh * _meta.dh);
+        auto batch_k_proj = create_batch_matrix(_meta.nkvh * _meta.dh);
+        auto batch_v_proj = create_batch_matrix(_meta.nkvh * _meta.dh);
         
         llaisys::ops::linear(batch_q_proj, batch_attn_norm, _weights.attn_q_w[layer], _weights.attn_q_b[layer]);
         llaisys::ops::linear(batch_k_proj, batch_attn_norm, _weights.attn_k_w[layer], _weights.attn_k_b[layer]);
         llaisys::ops::linear(batch_v_proj, batch_attn_norm, _weights.attn_v_w[layer], _weights.attn_v_b[layer]);
         
-        auto batch_q_view = batch_q_proj->view({batch, 1, _meta.nh, _meta.dh});
-        auto batch_k_view = batch_k_proj->view({batch, 1, _meta.nkvh, _meta.dh});
-        auto batch_v_view = batch_v_proj->view({batch, 1, _meta.nkvh, _meta.dh});
+        auto batch_q_view = batch_q_proj->view({batch, _meta.nh, _meta.dh});
+        auto batch_k_view = batch_k_proj->view({batch, _meta.nkvh, _meta.dh});
+        auto batch_v_view = batch_v_proj->view({batch, _meta.nkvh, _meta.dh});
         
-        auto batch_q_rope = create_batch_tensor({1, _meta.nh, _meta.dh});
-        auto batch_k_rope = create_batch_tensor({1, _meta.nkvh, _meta.dh});
+        auto batch_q_rope = Tensor::create({batch, _meta.nh, _meta.dh}, _meta.dtype, _device, _device_id);
+        auto batch_k_rope = Tensor::create({batch, _meta.nkvh, _meta.dh}, _meta.dtype, _device, _device_id);
 
         llaisys::ops::rope(batch_q_rope, batch_q_view, batch_pos_ids, _meta.theta);
         llaisys::ops::rope(batch_k_rope, batch_k_view, batch_pos_ids, _meta.theta);
 
-        auto batch_attn_out = create_batch_tensor({1, _meta.nh, _meta.dh});
+        auto batch_attn_out = Tensor::create({batch, _meta.nh, _meta.dh}, _meta.dtype, _device, _device_id);
 
         for (size_t b = 0; b < batch; ++b) {
             sessions[b]->ensure_capacity_for_next_token();
@@ -501,31 +499,31 @@ void Qwen2Model::process_batch(const std::vector<Qwen2Session*> &sessions, const
             llaisys::ops::self_attention(attn_out_slice, q_rope_slice, temp_k_cache, temp_v_cache, _attn_scale);
         }
 
-        auto batch_attn_out_flat = batch_attn_out->view({batch, 1, _meta.hs});
-        auto batch_attn_proj = create_batch_tensor({1, _meta.hs});
+        auto batch_attn_out_flat = batch_attn_out->view({batch, _meta.hs});
+        auto batch_attn_proj = create_batch_matrix(_meta.hs);
         
         llaisys::ops::linear(batch_attn_proj, batch_attn_out_flat, _weights.attn_o_w[layer], nullptr);
         llaisys::ops::add(batch_hidden, batch_hidden, batch_attn_proj);
 
         // FFN
-        auto batch_mlp_norm = create_batch_tensor({1, _meta.hs});
+        auto batch_mlp_norm = create_batch_matrix(_meta.hs);
         llaisys::ops::rms_norm(batch_mlp_norm, batch_hidden, _weights.mlp_norm_w[layer], _meta.epsilon);
         
-        auto batch_mlp_gate = create_batch_tensor({1, _meta.di});
-        auto batch_mlp_up = create_batch_tensor({1, _meta.di});
-        auto batch_mlp_act = create_batch_tensor({1, _meta.di});
+        auto batch_mlp_gate = create_batch_matrix(_meta.di);
+        auto batch_mlp_up = create_batch_matrix(_meta.di);
+        auto batch_mlp_act = create_batch_matrix(_meta.di);
         
         llaisys::ops::linear(batch_mlp_gate, batch_mlp_norm, _weights.mlp_gate_w[layer], nullptr);
         llaisys::ops::linear(batch_mlp_up, batch_mlp_norm, _weights.mlp_up_w[layer], nullptr);
         llaisys::ops::swiglu(batch_mlp_act, batch_mlp_gate, batch_mlp_up);
         
-        auto batch_mlp_down = create_batch_tensor({1, _meta.hs});
+        auto batch_mlp_down = create_batch_matrix(_meta.hs);
         llaisys::ops::linear(batch_mlp_down, batch_mlp_act, _weights.mlp_down_w[layer], nullptr);
         llaisys::ops::add(batch_hidden, batch_hidden, batch_mlp_down);
     }
 
     for (size_t b = 0; b < batch; ++b) {
-        auto hidden_slice = batch_hidden->slice(0, b, b+1)->view({1, _meta.hs});
+        auto hidden_slice = batch_hidden->slice(0, b, b+1);
         llaisys::ops::rearrange(sessions[b]->_hidden, hidden_slice);
         sessions[b]->advance(1);
     }
