@@ -355,15 +355,15 @@ std::vector<int64_t> Qwen2Model::infer_batch(
     }
 
     std::vector<bool> cacheable_prompts(batch_size, false);
+    std::vector<size_t> initial_seq_lens(batch_size, 0);
     for (size_t b = 0; b < batch_size; ++b) {
+        CHECK_ARGUMENT(sessions[b] != nullptr, "session is null");
         if (sessions[b]->seq_len() >= _meta.maxseq) {
             sessions[b]->reset();
         }
 
+        initial_seq_lens[b] = sessions[b]->seq_len();
         if (sessions[b]->seq_len() == 0) {
-            cacheable_prompts[b] = true;
-        } else if (batch_token_ids[b].size() <= sessions[b]->seq_len()) {
-            sessions[b]->reset();
             cacheable_prompts[b] = true;
         }
 
@@ -380,7 +380,7 @@ std::vector<int64_t> Qwen2Model::infer_batch(
         std::vector<int64_t> active_tokens;
 
         for (size_t b = 0; b < batch_size; ++b) {
-            if (step >= sessions[b]->seq_len() && step < batch_token_ids[b].size()) {
+            if (step < batch_token_ids[b].size()) {
                 active_sessions.push_back(sessions[b]);
                 active_tokens.push_back(batch_token_ids[b][step]);
                 any_active = true;
@@ -403,7 +403,9 @@ std::vector<int64_t> Qwen2Model::infer_batch(
 
         auto *session = sessions[b];
 
-        if (cacheable_prompts[b] && session->seq_len() == batch_token_ids[b].size()) {
+        if (cacheable_prompts[b]
+            && initial_seq_lens[b] == 0
+            && session->seq_len() == batch_token_ids[b].size()) {
             update_prefix_cache(session, batch_token_ids[b].data(), batch_token_ids[b].size());
         }
         
