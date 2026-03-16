@@ -14,7 +14,7 @@ namespace llaisys::models::qwen2 {
 // KVCacheBlock: Represents a fixed-size block of KV cache memory
 // -----------------------------------------------------------------------------
 struct KVCacheBlock {
-    int id;
+    size_t id;
     size_t size; // Number of tokens capacity (e.g. 16)
     size_t used; // Number of tokens currently stored
     
@@ -35,7 +35,7 @@ struct KVCacheBlock {
     // Pointers to next block in sequence (if we want linked list structure for prefix tree)
     // Or we manage tree externally.
     
-    KVCacheBlock(int id, size_t size, size_t nlayers, size_t nkvhead, size_t head_dim, 
+    KVCacheBlock(size_t id, size_t size, size_t nlayers, size_t nkvhead, size_t head_dim,
                  llaisysDataType_t dtype, llaisysDeviceType_t device, int device_id)
         : id(id), size(size), used(0) {
         
