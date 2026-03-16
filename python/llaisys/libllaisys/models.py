@@ -87,6 +87,20 @@ def load_models(lib):
     ]
     lib.llaisysQwen2ModelInferEx.restype = c_int64
 
+    lib.llaisysQwen2ModelInferBatch.argtypes = [
+        llaisysQwen2Model_t,
+        POINTER(llaisysQwen2Session_t),
+        POINTER(POINTER(c_int64)), # batch_token_ids (array of pointers)
+        POINTER(c_size_t), # ntokens (array of sizes)
+        c_int, # batch_size
+        POINTER(c_int), # top_ks
+        POINTER(c_float), # top_ps
+        POINTER(c_float), # temperatures
+        POINTER(c_int64), # seeds
+        POINTER(c_int64) # results
+    ]
+    lib.llaisysQwen2ModelInferBatch.restype = None
+
 
 
 __all__ = [

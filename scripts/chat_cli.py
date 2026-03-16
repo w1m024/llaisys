@@ -1,7 +1,15 @@
 import argparse
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PYTHON_SRC = REPO_ROOT / "python"
+if PYTHON_SRC.is_dir():
+    sys.path.insert(0, str(PYTHON_SRC))
+
 import llaisys
 from llaisys import DeviceType
+from llaisys.chat_format import assistant_prefills_think
 from transformers import AutoTokenizer
 
 def chat_cli():
@@ -35,61 +43,69 @@ def chat_cli():
 
     # Keep chat history
     history = []
-    
-    # Create a session if requested
     session = None
-    if args.use_session:
-        print("Creating session for KV cache reuse...")
-        session = model.create_session()
 
-    while True:
-        try:
-            user_input = input("\033[1;32mUser: \033[0m").strip()
-        except EOFError:
-            break
-            
-        if not user_input:
-            continue
-            
-        if user_input.lower() in {"exit", "quit"}:
-            print("Bye!")
-            break
+    try:
+        # Create a session if requested
+        if args.use_session:
+            print("Creating session for KV cache reuse...")
+            session = model.create_session()
 
-        history.append({"role": "user", "content": user_input})
+        while True:
+            try:
+                user_input = input("\033[1;32mUser: \033[0m").strip()
+            except EOFError:
+                break
 
-        # Format prompt with history
-        prompt_text = tokenizer.apply_chat_template(
-            history, tokenize=False, add_generation_prompt=True
-        )
-        input_ids = tokenizer.encode(prompt_text)
+            if not user_input:
+                continue
 
-        print("\033[1;34mAssistant: \033[0m", end="", flush=True)
+            if user_input.lower() in {"exit", "quit"}:
+                print("Bye!")
+                break
 
-        # Stream generation
-        stream_gen = model.generate(
-            input_ids,
-            max_new_tokens=args.max_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            seed=args.seed,
-            stream=True,
-            session=session
-        )
+            history.append({"role": "user", "content": user_input})
 
-        full_response = ""
-        try:
-            for token_id in stream_gen:
-                # Simple decoding (may have issues with multi-byte chars at boundaries)
-                # In production, use a stateful decoder
-                word = tokenizer.decode([token_id], skip_special_tokens=True)
-                print(word, end="", flush=True)
-                full_response += word
-        except KeyboardInterrupt:
-            print("\n[Generation stopped by user]")
-        
-        print("\n")
-        history.append({"role": "assistant", "content": full_response})
+            # Format prompt with history
+            prompt_text = tokenizer.apply_chat_template(
+                history, tokenize=False, add_generation_prompt=True
+            )
+            input_ids = tokenizer.encode(prompt_text)
+            prompt_prefilled_think = assistant_prefills_think(prompt_text)
+
+            print("\033[1;34mAssistant: \033[0m", end="", flush=True)
+
+            # Stream generation
+            stream_gen = model.generate(
+                input_ids,
+                max_new_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                seed=args.seed,
+                stream=True,
+                session=session
+            )
+
+            full_response = ""
+            if prompt_prefilled_think:
+                full_response = "<think>\n"
+                print(full_response, end="", flush=True)
+            try:
+                for token_id in stream_gen:
+                    # Simple decoding (may have issues with multi-byte chars at boundaries)
+                    # In production, use a stateful decoder
+                    word = tokenizer.decode([token_id], skip_special_tokens=True)
+                    print(word, end="", flush=True)
+                    full_response += word
+            except KeyboardInterrupt:
+                print("\n[Generation stopped by user]")
+
+            print("\n")
+            history.append({"role": "assistant", "content": full_response})
+    finally:
+        if session is not None:
+            model.destroy_session(session)
 
 if __name__ == "__main__":
     chat_cli()

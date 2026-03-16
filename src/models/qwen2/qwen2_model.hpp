@@ -6,6 +6,10 @@
 
 #include "llaisys/models/qwen2.h"
 
+#include <list>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace llaisys::models::qwen2 {
@@ -15,6 +19,11 @@ struct Qwen2Config {
     size_t maxseq;
     size_t nkvhead;
     size_t head_size;
+    size_t hidden_size;
+    size_t num_heads;
+    size_t intermediate_size;
+    size_t vocab_size;
+    llaisysDataType_t dtype;
 };
 
 struct Qwen2Weights {
@@ -47,41 +56,41 @@ public:
 
     void bind_weights(const LlaisysQwen2Weights &weights);
     int64_t infer(Qwen2Session *session, const int64_t *token_ids, size_t ntoken, int top_k, float top_p, float temperature, int64_t seed = -1);
+    
+    // Batch Inference API
+    std::vector<int64_t> infer_batch(
+        const std::vector<Qwen2Session*> &sessions,
+        const std::vector<std::vector<int64_t>> &batch_token_ids,
+        const std::vector<int> &top_ks,
+        const std::vector<float> &top_ps,
+        const std::vector<float> &temperatures,
+        const std::vector<int64_t> &seeds
+    );
 
 private:
+    struct PrefixCacheEntry {
+        std::vector<int64_t> token_ids;
+        std::vector<std::shared_ptr<KVCacheBlock>> blocks;
+        tensor_t hidden;
+    };
+
+    std::shared_ptr<PrefixCacheEntry> find_prefix_cache(const int64_t *token_ids, size_t ntoken);
+    void update_prefix_cache(Qwen2Session *session, const int64_t *token_ids, size_t ntoken);
+
     void process_token(Qwen2Session *session, int64_t token_id);
+    // Batch processing helper
+    void process_batch(const std::vector<Qwen2Session*> &sessions, const std::vector<int64_t> &token_ids);
 
     LlaisysQwen2Meta _meta;
     llaisysDeviceType_t _device;
     int _device_id;
     Qwen2Weights _weights;
     bool _weights_bound = false;
-
-    tensor_t _token_ids;
-    tensor_t _pos_ids;
-    tensor_t _hidden;
-    tensor_t _attn_norm;
-    tensor_t _q_proj;
-    tensor_t _k_proj;
-    tensor_t _v_proj;
-    tensor_t _q_view;
-    tensor_t _k_view;
-    tensor_t _v_view;
-    tensor_t _q_rope;
-    tensor_t _k_rope;
-    tensor_t _attn_out;
-    tensor_t _attn_out_flat;
-    tensor_t _attn_proj;
-    tensor_t _mlp_norm;
-    tensor_t _mlp_gate;
-    tensor_t _mlp_up;
-    tensor_t _mlp_act;
-    tensor_t _mlp_down;
-    tensor_t _final_norm;
-    tensor_t _logits;
-    tensor_t _logits_flat;
-    tensor_t _max_idx;
-    tensor_t _max_val;
+    std::shared_ptr<BlockManager> _block_manager;
+    std::unordered_map<size_t, std::shared_ptr<PrefixCacheEntry>> _prefix_cache;
+    std::list<size_t> _prefix_cache_order;
+    std::mutex _prefix_cache_mutex;
+    size_t _prefix_cache_capacity = 32;
 
     float _attn_scale = 1.0f;
 };

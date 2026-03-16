@@ -1,35 +1,64 @@
-import os
+import asyncio
+import argparse
 import time
 import uuid
-import json
-import asyncio
-from typing import List, Optional, Union, Dict, Any
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from transformers import AutoTokenizer
 
 import llaisys
 from llaisys import DeviceType
+from llaisys.chat_format import assistant_prefills_think, normalize_assistant_text
 
 # ==============================================================================
 # Global State & Configuration
 # ==============================================================================
 
+@dataclass
+class SessionState:
+    session: Any
+    cache_token_ids: List[int] = field(default_factory=list)
+    in_flight: bool = False
+    cancel_requested: bool = False
+
+class InferenceRequest:
+    def __init__(self, 
+                 input_ids: List[int], 
+                 generation_config: Dict[str, Any],
+                 response_queue: asyncio.Queue,
+                 session_state: SessionState,
+                 session_id: Optional[str] = None,
+                 persistent: bool = False):
+        self.input_ids = input_ids # Remaining prompt tokens to be processed
+        self.generation_config = generation_config
+        self.response_queue = response_queue
+        self.session_state = session_state
+        self.session_id = session_id
+        self.persistent = persistent
+        self.created_at = time.time()
+        self.generated_len = 0 # How many new tokens generated
+        self.finished = False
+        self.last_token: Optional[int] = None
+
 class GlobalState:
     model: Optional[llaisys.models.Qwen2] = None
     tokenizer: Optional[AutoTokenizer] = None
-    model_path: str = "/home/wsl/model/DeepSeek-R1-Distill-Qwen-1.5B"  # Default path
-    session_store: Dict[str, Any] = {}
-
+    model_path: Optional[str] = None
+    session_store: Dict[str, SessionState] = {}
+    request_queue: asyncio.Queue = None # Initialize in lifespan
+    
 state = GlobalState()
-
-# Lock for single-user blocking processing (Project #3 Requirement)
-# We use an asyncio Lock to ensure only one request is processed at a time.
-generation_lock = asyncio.Lock()
+PACKAGE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = PACKAGE_DIR / "static"
+INDEX_FILE = STATIC_DIR / "index.html"
 
 # ==============================================================================
 # Data Models (OpenAI Compatible)
@@ -77,24 +106,216 @@ class ChatCompletionStreamResponse(BaseModel):
     choices: List[ChatCompletionStreamResponseChoice]
 
 # ==============================================================================
+# Background Worker
+# ==============================================================================
+
+MAX_BATCH_SIZE = 8 # Configurable
+
+async def worker_loop():
+    print("Worker loop started.")
+    
+    # Active requests currently being processed
+    active_requests: List[InferenceRequest] = []
+    
+    while True:
+        try:
+            # 1. Fetch new requests if we have capacity
+            # We want to fill up to MAX_BATCH_SIZE
+            while len(active_requests) < MAX_BATCH_SIZE:
+                if state.request_queue.empty():
+                    break
+                try:
+                    # Non-blocking fetch
+                    req = state.request_queue.get_nowait()
+                    if req.session_state.cancel_requested:
+                        await _cancel_request(req)
+                        continue
+                    active_requests.append(req)
+                except asyncio.QueueEmpty:
+                    break
+            
+            # If no requests, wait for one
+            if not active_requests:
+                req = await state.request_queue.get()
+                if req.session_state.cancel_requested:
+                    await _cancel_request(req)
+                    await asyncio.sleep(0)
+                    continue
+                active_requests.append(req)
+
+            requests_to_remove = []
+            for req in active_requests:
+                if req.session_state.cancel_requested:
+                    await _cancel_request(req)
+                    requests_to_remove.append(req)
+
+            for req in requests_to_remove:
+                active_requests.remove(req)
+
+            if not active_requests:
+                await asyncio.sleep(0)
+                continue
+            
+            # 2. Prepare Batch
+            sessions = []
+            batch_input_ids = []
+            top_ks = []
+            top_ps = []
+            temperatures = []
+            seeds = []
+            consumed_inputs = []
+            
+            requests_to_remove = []
+            
+            for req in active_requests:
+                sessions.append(req.session_state.session)
+
+                if req.input_ids:
+                    next_tokens = list(req.input_ids)
+                    req.input_ids = []
+                elif req.last_token is not None:
+                    next_tokens = [req.last_token]
+                else:
+                    raise RuntimeError("Request has no tokens to process and no cached decode token")
+
+                batch_input_ids.append(next_tokens)
+                consumed_inputs.append(next_tokens)
+                top_ks.append(req.generation_config["top_k"])
+                top_ps.append(req.generation_config["top_p"])
+                temperatures.append(req.generation_config["temperature"])
+                seeds.append(req.generation_config["seed"])
+            
+            # 3. Run Inference
+            if not sessions:
+                continue
+                
+            # This runs ONE forward pass for everyone
+            # For those with multiple tokens (prompt), it processes them all and returns next token.
+            new_tokens = state.model.generate_batch(
+                sessions,
+                batch_input_ids,
+                top_ks,
+                top_ps,
+                temperatures,
+                seeds
+            )
+            
+            # 4. Process Results
+            for i, req in enumerate(active_requests):
+                req.session_state.cache_token_ids.extend(consumed_inputs[i])
+
+                if req.session_state.cancel_requested:
+                    await _cancel_request(req)
+                    requests_to_remove.append(req)
+                    continue
+
+                new_token = new_tokens[i]
+                req.last_token = new_token
+                req.generated_len += 1
+                
+                # Send to client
+                await req.response_queue.put({"token_id": new_token})
+                
+                # Check finish conditions
+                is_eos = (new_token == state.model._meta.end_token)
+                max_len_reached = (req.generated_len >= req.generation_config["max_new_tokens"])
+                
+                if is_eos or max_len_reached:
+                    await req.response_queue.put({"done": True})
+                    req.finished = True
+                    requests_to_remove.append(req)
+                    _cleanup_request(req)
+                    
+                    try:
+                        state.request_queue.task_done()
+                    except ValueError:
+                        pass
+            
+            # 5. Remove finished requests
+            for req in requests_to_remove:
+                active_requests.remove(req)
+                
+            # Yield to event loop
+            await asyncio.sleep(0)
+            
+        except asyncio.CancelledError:
+            for req in active_requests:
+                await req.response_queue.put({"error": "Worker cancelled"})
+                _cleanup_request(req, discard_session=req.persistent)
+            print("Worker loop cancelled.")
+            break
+        except Exception as e:
+            print(f"Worker loop error: {e}")
+            import traceback
+            traceback.print_exc()
+            for req in active_requests:
+                await req.response_queue.put({"error": str(e)})
+                _cleanup_request(req, discard_session=req.persistent)
+            active_requests.clear()
+            await asyncio.sleep(1)
+
+# ==============================================================================
 # Lifespan & App Initialization
 # ==============================================================================
 
+def configure_model_path(model_path: str) -> str:
+    resolved = Path(model_path).expanduser().resolve()
+    state.model_path = str(resolved)
+    return state.model_path
+
+
+def _resolve_model_path() -> str:
+    if not state.model_path:
+        raise RuntimeError(
+            "Model path is required. Start the server with "
+            "`python -m llaisys.server --model /abs/path/to/qwen2` "
+            "or call `llaisys.server.configure_model_path(...)` before running uvicorn."
+        )
+
+    model_path = Path(state.model_path).expanduser().resolve()
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model path not found: {model_path}")
+    if not model_path.is_dir():
+        raise NotADirectoryError(f"Model path is not a directory: {model_path}")
+
+    state.model_path = str(model_path)
+    return state.model_path
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Startup: Initialize Queues
+    state.request_queue = asyncio.Queue()
+
     # Startup: Load Model
-    print(f"Loading tokenizer from {state.model_path}...")
-    state.tokenizer = AutoTokenizer.from_pretrained(state.model_path, trust_remote_code=True)
+    model_path = _resolve_model_path()
+
+    print(f"Loading tokenizer from {model_path}...")
+    state.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     
-    print(f"Loading LLAISYS model from {state.model_path}...")
-    state.model = llaisys.models.Qwen2(state.model_path, DeviceType.CPU)
+    print(f"Loading LLAISYS model from {model_path}...")
+    state.model = llaisys.models.Qwen2(model_path, DeviceType.CPU)
     
     print("Model loaded successfully!")
+
+    # Start Worker
+    worker_task = asyncio.create_task(worker_loop())
+
     yield
-    # Shutdown: Clean up resources if needed
+    
+    # Shutdown: Clean up resources
     print("Shutting down...")
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
+
+    for session_state in list(state.session_store.values()):
+        _destroy_session(session_state)
+    state.session_store.clear()
 
 app = FastAPI(title="LLAISYS Chatbot Server", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ==============================================================================
 # Helper Functions
@@ -103,145 +324,269 @@ app = FastAPI(title="LLAISYS Chatbot Server", lifespan=lifespan)
 def _format_sse(data: BaseModel) -> str:
     return data.model_dump_json()
 
+
+def _is_prefix(prefix: List[int], tokens: List[int]) -> bool:
+    return len(prefix) <= len(tokens) and tokens[: len(prefix)] == prefix
+
+
+def _destroy_session(session_state: SessionState):
+    if state.model is None:
+        return
+    state.model.destroy_session(session_state.session)
+
+
+def _cleanup_request(req: InferenceRequest, discard_session: bool = False):
+    req.session_state.in_flight = False
+    req.session_state.cancel_requested = False
+    if discard_session or not req.persistent:
+        _destroy_session(req.session_state)
+        if req.session_id:
+            current_session = state.session_store.get(req.session_id)
+            if current_session is req.session_state:
+                state.session_store.pop(req.session_id, None)
+
+
+async def _cancel_request(req: InferenceRequest):
+    if req.finished:
+        return
+    req.finished = True
+    await req.response_queue.put({"done": True, "cancelled": True})
+    _cleanup_request(req, discard_session=True)
+    try:
+        state.request_queue.task_done()
+    except ValueError:
+        pass
+
+
+def _prepare_session(prompt_ids: List[int], session_id: Optional[str]) -> tuple[SessionState, List[int], bool]:
+    if not session_id:
+        session_state = SessionState(session=state.model.create_session(), in_flight=True)
+        return session_state, list(prompt_ids), False
+
+    session_state = state.session_store.get(session_id)
+    if session_state and session_state.in_flight:
+        raise HTTPException(status_code=409, detail=f"Session '{session_id}' is busy")
+
+    if session_state and _is_prefix(session_state.cache_token_ids, prompt_ids):
+        delta_ids = prompt_ids[len(session_state.cache_token_ids):]
+        if delta_ids:
+            session_state.in_flight = True
+            session_state.cancel_requested = False
+            return session_state, delta_ids, True
+
+    if session_state:
+        _destroy_session(session_state)
+
+    session_state = SessionState(session=state.model.create_session(), in_flight=True)
+    state.session_store[session_id] = session_state
+    return session_state, list(prompt_ids), True
+
 # ==============================================================================
 # API Endpoints
 # ==============================================================================
+
+@app.get("/", include_in_schema=False)
+async def chat_ui():
+    return FileResponse(INDEX_FILE)
+
+@app.delete("/v1/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    session_state = state.session_store.get(session_id)
+    if not session_state:
+        return {"deleted": False}
+    if session_state.in_flight:
+        raise HTTPException(status_code=409, detail=f"Session '{session_id}' is busy")
+
+    _destroy_session(session_state)
+    state.session_store.pop(session_id, None)
+    return {"deleted": True}
+
+
+@app.post("/v1/chat/sessions/{session_id}/cancel")
+async def cancel_chat_session(session_id: str):
+    session_state = state.session_store.get(session_id)
+    if not session_state or not session_state.in_flight:
+        return {"cancelled": False}
+
+    session_state.cancel_requested = True
+    state.session_store.pop(session_id, None)
+    return {"cancelled": True}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     if not state.model or not state.tokenizer:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    # Acquire lock for single-user processing
-    async with generation_lock:
-        # 0. Resolve Session
-        session = None
-        if request.session_id:
-            if request.session_id in state.session_store:
-                session = state.session_store[request.session_id]
-            else:
-                print(f"Creating new session for id: {request.session_id}")
-                session = state.model.create_session()
-                state.session_store[request.session_id] = session
+    # 1. Prepare Prompt
+    try:
+        # Convert Pydantic models to dicts for apply_chat_template
+        messages_list = [msg.model_dump() for msg in request.messages]
+        prompt_text = state.tokenizer.apply_chat_template(
+            messages_list, tokenize=False, add_generation_prompt=True
+        )
+        input_ids = state.tokenizer.encode(prompt_text)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Tokenization failed: {str(e)}")
 
-        # 1. Prepare Prompt
+    request_id = f"chatcmpl-{uuid.uuid4()}"
+    created_time = int(time.time())
+    prompt_prefilled_think = assistant_prefills_think(prompt_text)
+
+    # 2. Create Request Object
+    response_queue = asyncio.Queue()
+    gen_config = {
+        "max_new_tokens": request.max_tokens,
+        "top_k": request.top_k,
+        "top_p": request.top_p if request.top_p is not None else 0.0,
+        "temperature": request.temperature,
+        "seed": request.seed if request.seed is not None else -1
+    }
+    session_state, delta_input_ids, persistent = _prepare_session(input_ids, request.session_id)
+    
+    req = InferenceRequest(
+        input_ids=delta_input_ids,
+        generation_config=gen_config,
+        response_queue=response_queue,
+        session_state=session_state,
+        session_id=request.session_id,
+        persistent=persistent,
+    )
+
+    # 3. Put into Queue
+    await state.request_queue.put(req)
+
+    # 4. Stream Response (SSE)
+    async def event_generator():
         try:
-            # Convert Pydantic models to dicts for apply_chat_template
-            messages_list = [msg.model_dump() for msg in request.messages]
-            prompt_text = state.tokenizer.apply_chat_template(
-                messages_list, tokenize=False, add_generation_prompt=True
+            # Send initial role
+            chunk = ChatCompletionStreamResponse(
+                id=request_id,
+                created=created_time,
+                model=request.model,
+                choices=[ChatCompletionStreamResponseChoice(
+                    index=0,
+                    delta={"role": "assistant"},
+                    finish_reason=None
+                )]
             )
-            input_ids = state.tokenizer.encode(prompt_text)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Tokenization failed: {str(e)}")
+            yield {"data": _format_sse(chunk)}
 
-        request_id = f"chatcmpl-{uuid.uuid4()}"
-        created_time = int(time.time())
-
-        # 2. Stream Response
-        if request.stream:
-            async def event_generator():
-                stream_gen = state.model.generate(
-                    input_ids,
-                    max_new_tokens=request.max_tokens,
-                    top_k=request.top_k,
-                    top_p=request.top_p if request.top_p is not None else 0.0,
-                    temperature=request.temperature,
-                    seed=request.seed if request.seed is not None else -1,
-                    stream=True,
-                    session=session
+            if prompt_prefilled_think:
+                think_chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    created=created_time,
+                    model=request.model,
+                    choices=[ChatCompletionStreamResponseChoice(
+                        index=0,
+                        delta={"content": "<think>\n"},
+                        finish_reason=None
+                    )]
                 )
-                
-                # Send initial role
+                yield {"data": _format_sse(think_chunk)}
+
+            # Stream tokens from queue
+            while True:
+                item = await response_queue.get()
+
+                if "error" in item:
+                    yield {"event": "error", "data": item["error"]}
+                    break
+
+                if "done" in item:
+                    break
+
+                token_id = item["token_id"]
+                word = state.tokenizer.decode([token_id], skip_special_tokens=True)
+
                 chunk = ChatCompletionStreamResponse(
                     id=request_id,
                     created=created_time,
                     model=request.model,
                     choices=[ChatCompletionStreamResponseChoice(
                         index=0,
-                        delta={"role": "assistant"},
+                        delta={"content": word},
                         finish_reason=None
                     )]
                 )
                 yield {"data": _format_sse(chunk)}
 
-                # Stream tokens
-                generated_tokens = []
-                for token_id in stream_gen:
-                    generated_tokens.append(token_id)
-                    # Decode incrementally (simplification: decode single token)
-                    # In production, use a proper incremental decoder for UTF-8 safety
-                    word = state.tokenizer.decode([token_id], skip_special_tokens=True)
-                    
-                    chunk = ChatCompletionStreamResponse(
-                        id=request_id,
-                        created=created_time,
-                        model=request.model,
-                        choices=[ChatCompletionStreamResponseChoice(
-                            index=0,
-                            delta={"content": word},
-                            finish_reason=None
-                        )]
-                    )
-                    yield {"data": _format_sse(chunk)}
-                    
-                    # Yield to event loop to allow other async tasks (like heartbeats)
-                    # though we are holding the generation_lock, so no other generation happens.
-                    await asyncio.sleep(0)
-
-                # Send finish
-                chunk = ChatCompletionStreamResponse(
-                    id=request_id,
-                    created=created_time,
-                    model=request.model,
-                    choices=[ChatCompletionStreamResponseChoice(
-                        index=0,
-                        delta={},
-                        finish_reason="stop"
-                    )]
-                )
-                yield {"data": _format_sse(chunk)}
-                yield {"data": "[DONE]"}
-
-            return EventSourceResponse(event_generator())
-
-        # 3. Non-Stream Response
-        else:
-            output_ids = state.model.generate(
-                input_ids,
-                max_new_tokens=request.max_tokens,
-                top_k=request.top_k,
-                top_p=request.top_p if request.top_p is not None else 0.0,
-                temperature=request.temperature,
-                seed=request.seed if request.seed is not None else -1,
-                stream=False,
-                session=session
-            )
-            
-            # The generate method returns the full sequence (input + output)
-            # We need to extract only the new tokens
-            new_tokens = output_ids[len(input_ids):]
-            content = state.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            
-            # Construct usage dict
-            usage = {
-                "prompt_tokens": len(input_ids),
-                "completion_tokens": len(new_tokens),
-                "total_tokens": len(output_ids)
-            }
-
-            return ChatCompletionResponse(
+            # Send finish
+            chunk = ChatCompletionStreamResponse(
                 id=request_id,
                 created=created_time,
                 model=request.model,
-                choices=[ChatCompletionResponseChoice(
+                choices=[ChatCompletionStreamResponseChoice(
                     index=0,
-                    message=ChatMessage(role="assistant", content=content),
+                    delta={},
                     finish_reason="stop"
-                )],
-                usage=usage
+                )]
             )
+            yield {"data": _format_sse(chunk)}
+            yield {"data": "[DONE]"}
+        finally:
+            if session_state.in_flight:
+                session_state.cancel_requested = True
+
+    if request.stream:
+        return EventSourceResponse(event_generator())
+    else:
+        # Non-stream: Accumulate all tokens
+        content = ""
+        completion_tokens = 0
+        try:
+            while True:
+                item = await response_queue.get()
+                if "error" in item:
+                    raise HTTPException(status_code=500, detail=item["error"])
+                if "done" in item:
+                    break
+                token_id = item["token_id"]
+                completion_tokens += 1
+                content += state.tokenizer.decode([token_id], skip_special_tokens=True)
+        finally:
+            if session_state.in_flight:
+                session_state.cancel_requested = True
+
+        content = normalize_assistant_text(content, prompt_prefilled_think)
+
+        usage = {
+            "prompt_tokens": len(input_ids),
+            "completion_tokens": completion_tokens,
+            "total_tokens": len(input_ids) + completion_tokens,
+        }
+
+        return ChatCompletionResponse(
+            id=request_id,
+            created=created_time,
+            model=request.model,
+            choices=[ChatCompletionResponseChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content=content),
+                finish_reason="stop"
+            )],
+            usage=usage
+        )
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="LLAISYS FastAPI server")
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="Path to the local Qwen2 model directory.",
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="Server bind host.")
+    parser.add_argument("--port", type=int, default=8000, help="Server bind port.")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None):
+    args = parse_args(argv)
+    configure_model_path(args.model)
+
+    import uvicorn
+
+    uvicorn.run(app, host=args.host, port=args.port)
+
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    main()
