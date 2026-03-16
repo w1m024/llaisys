@@ -9,6 +9,7 @@ if PYTHON_SRC.is_dir():
 
 import llaisys
 from llaisys import DeviceType
+from llaisys.chat_format import assistant_prefills_think
 from transformers import AutoTokenizer
 
 def chat_cli():
@@ -70,6 +71,7 @@ def chat_cli():
                 history, tokenize=False, add_generation_prompt=True
             )
             input_ids = tokenizer.encode(prompt_text)
+            prompt_prefilled_think = assistant_prefills_think(prompt_text)
 
             print("\033[1;34mAssistant: \033[0m", end="", flush=True)
 
@@ -86,6 +88,9 @@ def chat_cli():
             )
 
             full_response = ""
+            if prompt_prefilled_think:
+                full_response = "<think>\n"
+                print(full_response, end="", flush=True)
             try:
                 for token_id in stream_gen:
                     # Simple decoding (may have issues with multi-byte chars at boundaries)

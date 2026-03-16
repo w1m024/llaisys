@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLAISYS</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-shell">
+        <aside class="sidebar">
+            <div class="brand-panel">
+                <p class="eyebrow">LLAISYS</p>
+                <h1>LLAISYS</h1>
+            </div>
+
+            <button id="new-chat-btn" class="primary-button" type="button">新建对话</button>
+
+            <div id="conversation-list" class="conversation-list" aria-label="对话列表"></div>
+        </aside>
+
+        <main class="workspace">
+            <header class="workspace-header">
+                <div>
+                    <p class="eyebrow">会话</p>
+                    <h2 id="conversation-title">新建对话</h2>
+                    <p id="conversation-status" class="status-text"></p>
+                </div>
+
+                <div class="header-actions">
+                    <button id="rename-chat-btn" class="ghost-button" type="button">重命名</button>
+                    <button id="delete-chat-btn" class="ghost-button danger-button" type="button">删除</button>
+                </div>
+            </header>
+
+            <section id="message-list" class="message-list" aria-live="polite"></section>
+
+            <form id="composer-form" class="composer">
+                <label class="composer-label" for="composer-input">输入内容</label>
+                <textarea
+                    id="composer-input"
+                    rows="4"
+                    placeholder="按 Enter 发送，Shift + Enter 换行。"
+                ></textarea>
+
+                <div class="composer-toolbar">
+                    <div class="settings-row">
+                        <label>
+                            <span>流式输出</span>
+                            <input id="stream-toggle" type="checkbox" checked>
+                        </label>
+                        <label>
+                            <span>温度</span>
+                            <input id="temperature-input" type="number" min="0" max="2" step="0.1" value="0.7">
+                        </label>
+                        <label>
+                            <span>最大 Token</span>
+                            <input id="max-tokens-input" type="number" min="1" max="2048" step="1" value="256">
+                        </label>
+                    </div>
+
+                    <button id="send-btn" class="primary-button" type="submit">发送</button>
+                </div>
+            </form>
+        </main>
+    </div>
+
+    <script type="module" src="/static/app.js"></script>
+</body>
+</html>

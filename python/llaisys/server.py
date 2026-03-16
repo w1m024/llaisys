@@ -4,14 +4,18 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from transformers import AutoTokenizer
 
 import llaisys
 from llaisys import DeviceType
+from llaisys.chat_format import assistant_prefills_think, normalize_assistant_text
 
 # ==============================================================================
 # Global State & Configuration
@@ -22,6 +26,7 @@ class SessionState:
     session: Any
     cache_token_ids: List[int] = field(default_factory=list)
     in_flight: bool = False
+    cancel_requested: bool = False
 
 class InferenceRequest:
     def __init__(self, 
@@ -50,6 +55,9 @@ class GlobalState:
     request_queue: asyncio.Queue = None # Initialize in lifespan
     
 state = GlobalState()
+PACKAGE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = PACKAGE_DIR / "static"
+INDEX_FILE = STATIC_DIR / "index.html"
 
 # ==============================================================================
 # Data Models (OpenAI Compatible)
@@ -118,6 +126,9 @@ async def worker_loop():
                 try:
                     # Non-blocking fetch
                     req = state.request_queue.get_nowait()
+                    if req.session_state.cancel_requested:
+                        await _cancel_request(req)
+                        continue
                     active_requests.append(req)
                 except asyncio.QueueEmpty:
                     break
@@ -125,7 +136,24 @@ async def worker_loop():
             # If no requests, wait for one
             if not active_requests:
                 req = await state.request_queue.get()
+                if req.session_state.cancel_requested:
+                    await _cancel_request(req)
+                    await asyncio.sleep(0)
+                    continue
                 active_requests.append(req)
+
+            requests_to_remove = []
+            for req in active_requests:
+                if req.session_state.cancel_requested:
+                    await _cancel_request(req)
+                    requests_to_remove.append(req)
+
+            for req in requests_to_remove:
+                active_requests.remove(req)
+
+            if not active_requests:
+                await asyncio.sleep(0)
+                continue
             
             # 2. Prepare Batch
             sessions = []
@@ -174,6 +202,12 @@ async def worker_loop():
             # 4. Process Results
             for i, req in enumerate(active_requests):
                 req.session_state.cache_token_ids.extend(consumed_inputs[i])
+
+                if req.session_state.cancel_requested:
+                    await _cancel_request(req)
+                    requests_to_remove.append(req)
+                    continue
+
                 new_token = new_tokens[i]
                 req.last_token = new_token
                 req.generated_len += 1
@@ -255,6 +289,7 @@ async def lifespan(app: FastAPI):
     state.session_store.clear()
 
 app = FastAPI(title="LLAISYS Chatbot Server", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ==============================================================================
 # Helper Functions
@@ -276,10 +311,25 @@ def _destroy_session(session_state: SessionState):
 
 def _cleanup_request(req: InferenceRequest, discard_session: bool = False):
     req.session_state.in_flight = False
+    req.session_state.cancel_requested = False
     if discard_session or not req.persistent:
         _destroy_session(req.session_state)
         if req.session_id:
-            state.session_store.pop(req.session_id, None)
+            current_session = state.session_store.get(req.session_id)
+            if current_session is req.session_state:
+                state.session_store.pop(req.session_id, None)
+
+
+async def _cancel_request(req: InferenceRequest):
+    if req.finished:
+        return
+    req.finished = True
+    await req.response_queue.put({"done": True, "cancelled": True})
+    _cleanup_request(req, discard_session=True)
+    try:
+        state.request_queue.task_done()
+    except ValueError:
+        pass
 
 
 def _prepare_session(prompt_ids: List[int], session_id: Optional[str]) -> tuple[SessionState, List[int], bool]:
@@ -295,6 +345,7 @@ def _prepare_session(prompt_ids: List[int], session_id: Optional[str]) -> tuple[
         delta_ids = prompt_ids[len(session_state.cache_token_ids):]
         if delta_ids:
             session_state.in_flight = True
+            session_state.cancel_requested = False
             return session_state, delta_ids, True
 
     if session_state:
@@ -307,6 +358,33 @@ def _prepare_session(prompt_ids: List[int], session_id: Optional[str]) -> tuple[
 # ==============================================================================
 # API Endpoints
 # ==============================================================================
+
+@app.get("/", include_in_schema=False)
+async def chat_ui():
+    return FileResponse(INDEX_FILE)
+
+@app.delete("/v1/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    session_state = state.session_store.get(session_id)
+    if not session_state:
+        return {"deleted": False}
+    if session_state.in_flight:
+        raise HTTPException(status_code=409, detail=f"Session '{session_id}' is busy")
+
+    _destroy_session(session_state)
+    state.session_store.pop(session_id, None)
+    return {"deleted": True}
+
+
+@app.post("/v1/chat/sessions/{session_id}/cancel")
+async def cancel_chat_session(session_id: str):
+    session_state = state.session_store.get(session_id)
+    if not session_state or not session_state.in_flight:
+        return {"cancelled": False}
+
+    session_state.cancel_requested = True
+    state.session_store.pop(session_id, None)
+    return {"cancelled": True}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
@@ -326,6 +404,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
     request_id = f"chatcmpl-{uuid.uuid4()}"
     created_time = int(time.time())
+    prompt_prefilled_think = assistant_prefills_think(prompt_text)
 
     # 2. Create Request Object
     response_queue = asyncio.Queue()
@@ -352,58 +431,75 @@ async def chat_completions(request: ChatCompletionRequest):
 
     # 4. Stream Response (SSE)
     async def event_generator():
-        # Send initial role
-        chunk = ChatCompletionStreamResponse(
-            id=request_id,
-            created=created_time,
-            model=request.model,
-            choices=[ChatCompletionStreamResponseChoice(
-                index=0,
-                delta={"role": "assistant"},
-                finish_reason=None
-            )]
-        )
-        yield {"data": _format_sse(chunk)}
-
-        # Stream tokens from queue
-        while True:
-            item = await response_queue.get()
-            
-            if "error" in item:
-                yield {"event": "error", "data": item["error"]}
-                break
-                
-            if "done" in item:
-                break
-                
-            token_id = item["token_id"]
-            word = state.tokenizer.decode([token_id], skip_special_tokens=True)
-            
+        try:
+            # Send initial role
             chunk = ChatCompletionStreamResponse(
                 id=request_id,
                 created=created_time,
                 model=request.model,
                 choices=[ChatCompletionStreamResponseChoice(
                     index=0,
-                    delta={"content": word},
+                    delta={"role": "assistant"},
                     finish_reason=None
                 )]
             )
             yield {"data": _format_sse(chunk)}
-            
-        # Send finish
-        chunk = ChatCompletionStreamResponse(
-            id=request_id,
-            created=created_time,
-            model=request.model,
-            choices=[ChatCompletionStreamResponseChoice(
-                index=0,
-                delta={},
-                finish_reason="stop"
-            )]
-        )
-        yield {"data": _format_sse(chunk)}
-        yield {"data": "[DONE]"}
+
+            if prompt_prefilled_think:
+                think_chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    created=created_time,
+                    model=request.model,
+                    choices=[ChatCompletionStreamResponseChoice(
+                        index=0,
+                        delta={"content": "<think>\n"},
+                        finish_reason=None
+                    )]
+                )
+                yield {"data": _format_sse(think_chunk)}
+
+            # Stream tokens from queue
+            while True:
+                item = await response_queue.get()
+
+                if "error" in item:
+                    yield {"event": "error", "data": item["error"]}
+                    break
+
+                if "done" in item:
+                    break
+
+                token_id = item["token_id"]
+                word = state.tokenizer.decode([token_id], skip_special_tokens=True)
+
+                chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    created=created_time,
+                    model=request.model,
+                    choices=[ChatCompletionStreamResponseChoice(
+                        index=0,
+                        delta={"content": word},
+                        finish_reason=None
+                    )]
+                )
+                yield {"data": _format_sse(chunk)}
+
+            # Send finish
+            chunk = ChatCompletionStreamResponse(
+                id=request_id,
+                created=created_time,
+                model=request.model,
+                choices=[ChatCompletionStreamResponseChoice(
+                    index=0,
+                    delta={},
+                    finish_reason="stop"
+                )]
+            )
+            yield {"data": _format_sse(chunk)}
+            yield {"data": "[DONE]"}
+        finally:
+            if session_state.in_flight:
+                session_state.cancel_requested = True
 
     if request.stream:
         return EventSourceResponse(event_generator())
@@ -411,15 +507,21 @@ async def chat_completions(request: ChatCompletionRequest):
         # Non-stream: Accumulate all tokens
         content = ""
         completion_tokens = 0
-        while True:
-            item = await response_queue.get()
-            if "error" in item:
-                raise HTTPException(status_code=500, detail=item["error"])
-            if "done" in item:
-                break
-            token_id = item["token_id"]
-            completion_tokens += 1
-            content += state.tokenizer.decode([token_id], skip_special_tokens=True)
+        try:
+            while True:
+                item = await response_queue.get()
+                if "error" in item:
+                    raise HTTPException(status_code=500, detail=item["error"])
+                if "done" in item:
+                    break
+                token_id = item["token_id"]
+                completion_tokens += 1
+                content += state.tokenizer.decode([token_id], skip_special_tokens=True)
+        finally:
+            if session_state.in_flight:
+                session_state.cancel_requested = True
+
+        content = normalize_assistant_text(content, prompt_prefilled_think)
 
         usage = {
             "prompt_tokens": len(input_ids),

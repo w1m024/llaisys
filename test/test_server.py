@@ -236,7 +236,7 @@ def test_delete_chat_session_rejects_busy_session():
 
 def test_cancel_chat_session_stops_stream_and_releases_busy_session():
     async def scenario():
-        fake_model = FakeModel([[11, 12, 13, 0]], delay=0.02)
+        fake_model = FakeModel([[11, 12, 13, 0], [21]], delay=0.02)
         _reset_server_state(fake_model)
 
         request = server.ChatCompletionRequest(
@@ -261,6 +261,15 @@ def test_cancel_chat_session_stops_stream_and_releases_busy_session():
 
             cancel_response = await server.cancel_chat_session("chat-1")
             assert cancel_response == {"cancelled": True}
+            assert "chat-1" not in server.state.session_store
+
+            follow_up = server.ChatCompletionRequest(
+                messages=[server.ChatMessage(role="user", content="9")],
+                max_tokens=1,
+                session_id="chat-1",
+            )
+            follow_up_response = await server.chat_completions(follow_up)
+            assert follow_up_response.choices[0].message.content == "21"
 
             remaining_tokens = []
             saw_done = False

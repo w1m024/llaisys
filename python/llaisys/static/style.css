@@ -1,0 +1,436 @@
+:root {
+    --bg: #eaf3ff;
+    --panel: rgba(247, 251, 255, 0.82);
+    --panel-strong: #ffffff;
+    --line: rgba(57, 104, 165, 0.16);
+    --text: #183555;
+    --muted: #607c9b;
+    --accent: #2f78d8;
+    --accent-strong: #185fbf;
+    --user-bubble: #dcecff;
+    --assistant-bubble: #f8fbff;
+    --danger: #bf4d5d;
+    --shadow: 0 18px 40px rgba(33, 86, 150, 0.14);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    min-height: 100%;
+}
+
+body {
+    background:
+        radial-gradient(circle at top left, rgba(128, 180, 255, 0.34), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(74, 129, 210, 0.22), transparent 24%),
+        var(--bg);
+    color: var(--text);
+    font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+}
+
+button,
+input,
+textarea {
+    font: inherit;
+}
+
+::selection {
+    background: rgba(47, 120, 216, 0.2);
+}
+
+.app-shell {
+    display: grid;
+    grid-template-columns: 320px minmax(0, 1fr);
+    min-height: 100vh;
+    gap: 18px;
+    padding: 18px;
+}
+
+.sidebar,
+.workspace {
+    backdrop-filter: blur(12px);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 28px;
+    box-shadow: var(--shadow);
+}
+
+.sidebar {
+    display: flex;
+    flex-direction: column;
+    padding: 20px;
+    gap: 18px;
+}
+
+.brand-panel h1,
+.workspace-header h2 {
+    margin: 0;
+    font-family: Georgia, "Times New Roman", serif;
+    font-weight: 700;
+}
+
+.brand-panel h1 {
+    font-size: 2rem;
+    line-height: 1.05;
+}
+
+.workspace-header h2 {
+    font-size: 2.1rem;
+    line-height: 1.1;
+}
+
+.eyebrow {
+    margin: 0 0 8px;
+    color: var(--accent);
+    font-size: 0.74rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+}
+
+.status-text {
+    margin: 0;
+    color: var(--muted);
+    line-height: 1.5;
+}
+
+.conversation-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+    overflow: auto;
+}
+
+.conversation-card {
+    width: 100%;
+    border: 1px solid transparent;
+    border-radius: 18px;
+    background: rgba(249, 252, 255, 0.82);
+    color: inherit;
+    cursor: pointer;
+    text-align: left;
+    padding: 14px;
+    transition: border-color 140ms ease, background 140ms ease;
+}
+
+.conversation-card:hover,
+.conversation-card:focus-visible {
+    border-color: rgba(47, 120, 216, 0.34);
+}
+
+.conversation-card.active {
+    border-color: rgba(47, 120, 216, 0.54);
+    background: rgba(220, 236, 255, 0.92);
+}
+
+.conversation-title {
+    margin: 0 0 6px;
+    font-weight: 700;
+}
+
+.conversation-meta {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.92rem;
+}
+
+.workspace {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    min-height: calc(100vh - 36px);
+    padding: 24px;
+    gap: 18px;
+}
+
+.workspace-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.header-actions {
+    display: flex;
+    gap: 10px;
+}
+
+.message-list {
+    min-height: 0;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding-right: 4px;
+}
+
+.empty-state {
+    padding: 28px;
+    border: 1px dashed var(--line);
+    border-radius: 24px;
+    background: rgba(252, 254, 255, 0.9);
+    color: var(--muted);
+    line-height: 1.7;
+}
+
+.message-row {
+    display: flex;
+}
+
+.message-row.user {
+    justify-content: flex-end;
+}
+
+.message-row.assistant {
+    justify-content: flex-start;
+}
+
+.message-bubble {
+    width: min(760px, 100%);
+    border-radius: 24px;
+    border: 1px solid var(--line);
+    padding: 16px 18px;
+    white-space: pre-wrap;
+    line-height: 1.65;
+}
+
+.message-row.user .message-bubble {
+    background: var(--user-bubble);
+}
+
+.message-row.assistant .message-bubble {
+    background: var(--assistant-bubble);
+}
+
+.message-label {
+    margin: 0 0 10px;
+    color: var(--muted);
+    font-size: 0.82rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.message-content {
+    margin: 0;
+}
+
+.message-content.pending {
+    color: var(--muted);
+    font-style: italic;
+}
+
+.answer-content {
+    color: var(--text);
+}
+
+.message-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.think-block {
+    margin: 0 0 12px;
+    border: 1px dashed rgba(57, 104, 165, 0.2);
+    border-radius: 18px;
+    background: rgba(76, 125, 196, 0.08);
+    padding: 10px 12px;
+}
+
+.think-block summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 0.82rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.think-block[open] summary {
+    margin-bottom: 10px;
+}
+
+.think-text {
+    margin: 0;
+    color: #6b7f98;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.6;
+    font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+}
+
+.inline-editor {
+    display: grid;
+    gap: 10px;
+}
+
+.inline-editor textarea,
+#composer-input,
+.settings-row input[type="number"] {
+    width: 100%;
+    border-radius: 18px;
+    border: 1px solid var(--line);
+    background: var(--panel-strong);
+    color: var(--text);
+}
+
+.inline-editor textarea:focus,
+#composer-input:focus,
+.settings-row input[type="number"]:focus {
+    outline: none;
+    border-color: rgba(47, 120, 216, 0.45);
+    box-shadow: 0 0 0 4px rgba(47, 120, 216, 0.12);
+}
+
+.inline-editor textarea,
+#composer-input {
+    padding: 14px 16px;
+    resize: vertical;
+    min-height: 120px;
+}
+
+.inline-editor-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 8px;
+}
+
+.inline-editor-actions .primary-button,
+.inline-editor-actions .ghost-button {
+    min-height: 44px;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+.composer {
+    border: 1px solid var(--line);
+    border-radius: 24px;
+    padding: 18px;
+    background: rgba(248, 252, 255, 0.9);
+}
+
+.composer-label {
+    display: block;
+    margin-bottom: 10px;
+    color: var(--muted);
+    font-size: 0.86rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.composer-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    margin-top: 14px;
+}
+
+.settings-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+
+.settings-row label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+}
+
+.settings-row input[type="checkbox"] {
+    accent-color: var(--accent);
+}
+
+.settings-row input[type="number"] {
+    padding: 8px 10px;
+    width: 92px;
+}
+
+.primary-button,
+.ghost-button {
+    border-radius: 999px;
+    border: 1px solid transparent;
+    padding: 11px 16px;
+    cursor: pointer;
+    transition: transform 140ms ease, background 140ms ease, border-color 140ms ease;
+}
+
+.primary-button:hover,
+.ghost-button:hover,
+.primary-button:focus-visible,
+.ghost-button:focus-visible {
+    transform: translateY(-1px);
+}
+
+.primary-button {
+    background: var(--accent);
+    color: #f7fbff;
+    box-shadow: 0 12px 24px rgba(47, 120, 216, 0.18);
+}
+
+.primary-button:hover,
+.primary-button:focus-visible {
+    background: var(--accent-strong);
+}
+
+.ghost-button {
+    background: transparent;
+    border-color: var(--line);
+    color: var(--text);
+}
+
+.ghost-button:hover,
+.ghost-button:focus-visible {
+    background: rgba(47, 120, 216, 0.08);
+}
+
+.ghost-button.danger-button {
+    color: var(--danger);
+}
+
+@media (max-width: 960px) {
+    .app-shell {
+        grid-template-columns: 1fr;
+    }
+
+    .workspace {
+        min-height: auto;
+    }
+}
+
+@media (max-width: 640px) {
+    .app-shell {
+        padding: 12px;
+        gap: 12px;
+    }
+
+    .sidebar,
+    .workspace {
+        border-radius: 22px;
+    }
+
+    .workspace-header,
+    .composer-toolbar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .header-actions {
+        width: 100%;
+    }
+
+    .header-actions button,
+    .composer-toolbar .primary-button {
+        width: 100%;
+    }
+}
